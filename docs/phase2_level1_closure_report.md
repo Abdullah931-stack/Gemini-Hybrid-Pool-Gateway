@@ -3,7 +3,7 @@
 | Field | Value |
 | :--- | :--- |
 | **Phase / Topological Level** | Phase 2 / Level 1 — Stateless Protocol Filters, Schema Sanitizers & WAF Shield |
-| **Release Version** | `0.1.1` ([`CHANGELOG.md`](../CHANGELOG.md)) |
+| **Release Version** | `0.1.1` ([`changelog.md`](changelog.md)) |
 | **Date** | `2026-10-16` |
 | **Verification Gate** | **Verification Gate 2 — PASSED** (`20/20` Gate 2 tests passed; `39/39` cumulative tests passed) |
 | **Delivered Modules** | [`core/token_saver.py`](../core/token_saver.py), [`core/schema_sanitizer.py`](../core/schema_sanitizer.py), [`core/__init__.py`](../core/__init__.py) |

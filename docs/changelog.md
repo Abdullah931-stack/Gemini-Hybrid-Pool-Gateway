@@ -1,0 +1,121 @@
+# Changelog
+
+All notable changes to the **Gemini-Hybrid-Pool-Gateway** (`v3.2` architecture) are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.2] - 2026-10-17
+
+### Added
+
+- **OAuth 2.0 + PKCE Authentication & Lifecycle Engine ([`core/auth_oauth_cli.py`](../core/auth_oauth_cli.py)):**
+  - Implemented RFC 7636 compliant PKCE challenge generation via [`generate_pkce_pair(verifier_length: int = 64) -> PKCEChallenge`](../core/auth_oauth_cli.py#L166-L193) and authorization URL constructor [`build_authorization_url(redirect_uri: str, pkce: PKCEChallenge, client_id: str | None = None, scopes: Sequence[str] = OAUTH_SCOPES) -> str`](../core/auth_oauth_cli.py#L195-L216) requesting all 5 mandatory Google OAuth scopes ([`OAUTH_SCOPES`](../core/auth_oauth_cli.py#L40-L46)).
+  - Implemented dual callback handling: local ephemeral HTTP callback listener [`OAuthCallbackServer`](../core/auth_oauth_cli.py#L294-L392) / [`wait_for_oauth_callback`](../core/auth_oauth_cli.py#L394-L404) on `127.0.0.1` (`asyncio.start_server`) returning styled HTML completion/error pages, and manual callback extraction [`extract_code_from_manual_input(raw_input: str, expected_state: str | None = None) -> str`](../core/auth_oauth_cli.py#L250-L278) supporting raw authorization codes, full callback URLs, and query strings.
+  - Implemented [`exchange_code_for_tokens`](../core/auth_oauth_cli.py#L440-L485) and managed project discovery [`discover_project_id(access_token: str, ...) -> tuple[str, bool, dict[str, Any]]`](../core/auth_oauth_cli.py#L524-L557) via `cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`, plus end-to-end wrapper [`complete_oauth_login`](../core/auth_oauth_cli.py#L559-L589).
+  - Implemented proactive token refresh [`needs_token_refresh(credentials: OAuthCredentials, ..., margin_seconds: int = 300) -> bool`](../core/auth_oauth_cli.py#L596-L606), per-account lock synchronization [`refresh_account_token(account: OAuthAccount, ...) -> OAuthCredentials`](../core/auth_oauth_cli.py#L609-L668) under `account.token_refresh_lock` with strict in-flight request deduplication and atomic snapshot persistence, and [`ensure_valid_access_token`](../core/auth_oauth_cli.py#L670-L684).
+  - Implemented dual transport helpers: [`build_v1internal_headers(access_token: str, ide_type: str = "IDE_UNSPECIFIED") -> dict[str, str]`](../core/auth_oauth_cli.py#L691-L706) with CloudCode-PA Header Shield, and [`build_agy_subprocess_command`](../core/auth_oauth_cli.py#L709-L728) with async streaming wrapper [`AgySubprocessTransport`](../core/auth_oauth_cli.py#L730-L816) for `agy --input-format stream-json --output-format stream-json`.
+- **Web Pool Authentication, Firefox SQLite Extractor, Cookie Cache & Concurrency Guard — ADR-03 ([`core/auth_web.py`](../core/auth_web.py)):**
+  - Implemented isolated Firefox SQLite cookie extraction [`extract_firefox_cookies(cookie_file: str | Path, ...) -> WebCookies`](../core/auth_web.py#L257-L286) extracting `__Secure-1PSID` and `__Secure-1PSIDTS` via `browser_cookie3` with direct read-only `sqlite3` fallback against `moz_cookies` and temporary WAL/SHM sidecar copying.
+  - Implemented manual cookie ingestion [`parse_manual_cookies(secure_1psid: str, secure_1psidts: str = "") -> WebCookies`](../core/auth_web.py#L303-L317) and polymorphic parser [`parse_cookie_header_or_dict(raw_input: str | Mapping[str, Any]) -> WebCookies`](../core/auth_web.py#L384-L407) supporting JSON cookie objects, browser-extension JSON lists, and raw `Cookie:` header strings.
+  - Added [`get_saved_info_hygiene_notice() -> dict[str, Any]`](../core/auth_web.py#L409-L427) providing bilingual guidance to disable account-level `Saved Info` memory and close private browsing windows immediately to prevent concurrent `__Secure-1PSIDTS` invalidation.
+  - Implemented per-account cookie cache isolation: [`get_account_cookie_cache_path(account_id: str, ...) -> Path`](../core/auth_web.py#L446-L470) with strict regex and path-traversal rejection, [`save_account_cookies_isolated(account: WebAccount, ...) -> Path`](../core/auth_web.py#L538-L567) under `account.cookie_write_lock` with atomic `.tmp` + `os.replace` persistence, [`load_account_cookies_isolated`](../core/auth_web.py#L569-L594), and [`extract_client_web_cookies`](../core/auth_web.py#L493-L512).
+  - Implemented [`WebSessionManager`](../core/auth_web.py#L645-L812) managing independent `GeminiClient` instances: [`get_or_init_client`](../core/auth_web.py#L694-L716) initialized with `auto_close=False, auto_refresh=True` under `account.reinit_lock`, [`safe_reinit_or_close`](../core/auth_web.py#L744-L772) raising [`ActiveRequestsConcurrencyError`](../core/auth_web.py#L106-L116) if `account.active_requests > 0` ($C_{\text{web}, i} > 0$) to protect active streams, [`close_client_if_idle`](../core/auth_web.py#L774-L776), and [`flush_all_cookies`](../core/auth_web.py#L778-L812).
+- **Dynamic Model Discovery, Reasoning Effort Translation & Unified Registry ([`core/model_registry.py`](../core/model_registry.py)):**
+  - Implemented model normalization [`normalize_model_id(raw_name: str) -> str`](../core/model_registry.py#L119-L123) and suffix splitting [`split_model_effort_suffix(model_name: str) -> tuple[str, ReasoningEffort | None]`](../core/model_registry.py#L125-L134).
+  - Implemented reasoning effort translation: [`build_oauth_thinking_config(effort: ReasoningEffort | str = "low") -> dict[str, Any]`](../core/model_registry.py#L150-L156), [`inject_oauth_thinking_config`](../core/model_registry.py#L158-L165), and [`parse_model_and_effort(model_name: str, ...) -> ResolvedModelSpec`](../core/model_registry.py#L181-L203) mapping `minimal`, `low`, `medium`, and `high` to thinking budgets (`1024`, `4096`, `16384`, `32768`), setting Web `extended_thinking = (effort != "minimal")`, and defaulting routine tasks to `low`.
+  - Implemented OAuth CLI model discovery [`discover_oauth_models(account: OAuthAccount, ...) -> list[str]`](../core/model_registry.py#L514-L530) querying `v1internal:fetchAvailableModels` with automatic fallback to `v1internal:retrieveUserQuota` on `403 Forbidden`, populating `account.discovered_models` and `account.quota_state.model_quotas`.
+  - Implemented Web pool dynamic model discovery and target resolution [`discover_web_models`](../core/model_registry.py#L573-L586), [`discover_web_models_sync`](../core/model_registry.py#L589-L605), [`resolve_web_model`](../core/model_registry.py#L608-L622), and [`resolve_web_model_sync`](../core/model_registry.py#L624-L638).
+  - Implemented [`UnifiedModelRegistry`](../core/model_registry.py#L660-L777) aggregating base models and effort suffix variants, exposing OpenAI-compatible [`list_openai_models() -> dict[str, Any]`](../core/model_registry.py#L710-L725) (`GET /v1/models`), and resolving accounts supporting a model via [`get_supporting_accounts`](../core/model_registry.py#L782-L795) and [`get_supporting_account_objects`](../core/model_registry.py#L797-L812).
+- **Cross-Platform 3-Tier Context Rehydration Engine & Hybrid Prefix Differ — ADR-08 ([`core/prefix_differ.py`](../core/prefix_differ.py)):**
+  - Implemented deterministic SHA-256 sequential message hashing [`normalize_message_for_hash(message: Mapping[str, Any]) -> str`](../core/prefix_differ.py#L208-L235), cumulative prefix hashing [`compute_prefix_hashes(messages: Sequence[Mapping[str, Any]]) -> list[str]`](../core/prefix_differ.py#L237-L250), and character length calculation [`compute_messages_char_length`](../core/prefix_differ.py#L267-L282).
+  - Implemented adaptive session mode [`should_use_temporary_session(messages, tools) -> bool`](../core/prefix_differ.py#L289-L315) selecting `temporary=True` for single-turn tool-less queries and `temporary=False` for multi-turn agent conversations or tool requests.
+  - Implemented active chat tracking and 60-minute idle chat garbage collection [`register_chat_activity`](../core/prefix_differ.py#L318-L340), [`get_tracked_chats`](../core/prefix_differ.py#L346-L349), and [`cleanup_expired_chats(client_resolver, ...) -> int`](../core/prefix_differ.py#L399-L433) safely deleting idle Web chats from Google and purging associated records from LMDB `db_sessions`.
+  - Implemented $O(k)$ longest prefix matching [`find_longest_prefix_session`](../core/prefix_differ.py#L447-L479) in LMDB `db_sessions` and session affinity lookup [`get_preferred_session_account`](../core/prefix_differ.py#L481-L503) enforcing `SESSION_AFFINITY_MAX_CONTEXT_CHARS = 120_000`.
+  - Implemented structured XML history and tool response rendering [`format_tool_response_block(call_id: str, name: str, content: str) -> str`](../core/prefix_differ.py#L510-L520) (`<tool_response call_id="..." name="...">`) and [`format_messages_as_xml_history`](../core/prefix_differ.py#L567-L574) (`<conversation_history>`).
+  - Implemented cross-platform temporary directory resolution [`resolve_temp_history_dir(override_dir = None) -> Path`](../core/prefix_differ.py#L628-L647) prioritizing `/dev/shm` on Linux and falling back to `tempfile.gettempdir()` on Windows/macOS.
+  - Implemented the 3-Tier Context Rehydration Engine via [`build_rehydration_plan(...) -> RehydrationPlan`](../core/prefix_differ.py#L834-L929):
+    - **Tier 1 (`tier1_prefix_hit`):** Same-account prefix hit in `db_sessions`; sends delta messages only under `account.get_conversation_lock(cid)` with `<tool_response>` blocks.
+    - **Tier 2 (`tier2_inline_history`):** New session or account failover with context $\le 60,000$ characters; inlines prior turns inside `<conversation_history>`.
+    - **Tier 3 (`tier3_temp_file_passthrough`):** Context $> 60,000$ characters; writes `messages[:-3]` to `harness_history_{uuid4().hex}.txt`, pins `system`, `tools`, and `messages[-3:]` in prompt, and attaches the history file.
+  - Implemented deterministic temp file cleanup [`remove_temp_history_file`](../core/prefix_differ.py#L936-L948), startup orphan sweeper [`cleanup_orphaned_temp_files(temp_dir = None) -> int`](../core/prefix_differ.py#L950-L961), sync/async context manager [`RehydrationContextManager`](../core/prefix_differ.py#L963-L980) / [`managed_rehydration_plan`](../core/prefix_differ.py#L982-L990), and stream runner [`execute_rehydrated_stream`](../core/prefix_differ.py#L1094-L1138) (aliased as [`execute_with_rehydration`](../core/prefix_differ.py#L1140)).
+- **Package Re-exports ([`core/__init__.py`](../core/__init__.py)):**
+  - Re-exported all Level 1 and Level 2 public symbols (68 exported symbols across schema sanitation, token compression, OAuth authentication, Web authentication, model registry, and context rehydration) in `__all__`.
+
+### Security
+
+- **Strict Production Endpoint Enforcement ([`core/auth_oauth_cli.py`](../core/auth_oauth_cli.py)):**
+  - Implemented [`validate_production_endpoint(url: str) -> str`](../core/auth_oauth_cli.py#L127-L143) strictly blocking `daily-cloudcode-pa.googleapis.com` and requiring production `cloudcode-pa.googleapis.com` endpoints exclusively.
+- **Browser Isolation & DBSC Avoidance — ADR-03 ([`core/auth_web.py`](../core/auth_web.py)):**
+  - Implemented [`reject_chromium_cookie_source(source_identifier: str | Path) -> None`](../core/auth_web.py#L123-L141) raising [`ChromiumDBSCUnsupportedError`](../core/auth_web.py#L98-L104) for all Chromium browsers (`chrome`, `edge`, `brave`, `opera`, `arc`, `vivaldi`) to prevent Device Bound Session Credential invalidation.
+- **Process Environment Sanitization ([`core/auth_web.py`](../core/auth_web.py)):**
+  - Implemented [`sanitize_shared_cookie_env() -> str | None`](../core/auth_web.py#L434-L444) removing `GEMINI_COOKIE_PATH` from `os.environ` to eliminate cross-account cookie contamination.
+- **Path-Traversal Protection ([`core/auth_web.py`](../core/auth_web.py)):**
+  - Enforced strict regex matching and resolved parent directory validation in [`get_account_cookie_cache_path`](../core/auth_web.py#L446-L470) to prevent directory traversal attacks via malicious account identifiers.
+
+### Verified
+
+- **Verification Gate 3 ([`tests/test_level2_gate3.py`](../tests/test_level2_gate3.py), [`tests/test_auth_oauth_cli.py`](../tests/test_auth_oauth_cli.py), [`tests/test_auth_web.py`](../tests/test_auth_web.py), [`tests/test_model_registry.py`](../tests/test_model_registry.py), [`tests/test_prefix_differ.py`](../tests/test_prefix_differ.py)):**
+  - Added 90 comprehensive unit, concurrency, end-to-end, and parametrized tests verifying Level 2 OAuth PKCE authentication, token refresh deduplication, Web session management and concurrency guards, dynamic model discovery, reasoning effort translation, and 3-tier context rehydration with deterministic temp file cleanup.
+  - Combined test suite execution across all levels:
+    - Level 0 Gate 1 ([`tests/test_level0_gate1.py`](../tests/test_level0_gate1.py)): **19 passed**
+    - Level 1 Gate 2 ([`tests/test_level1_gate2.py`](../tests/test_level1_gate2.py)): **20 passed**
+    - Level 2 Gate 3 ([`tests/test_level2_gate3.py`](../tests/test_level2_gate3.py) [28 items], [`tests/test_auth_oauth_cli.py`](../tests/test_auth_oauth_cli.py) [10 items], [`tests/test_auth_web.py`](../tests/test_auth_web.py) [26 items], [`tests/test_model_registry.py`](../tests/test_model_registry.py) [11 items], [`tests/test_prefix_differ.py`](../tests/test_prefix_differ.py) [15 items]): **90 passed**
+    - **Total: 129 passed in 7.32s** with zero regressions.
+
+---
+
+## [0.1.1] - 2026-10-16
+
+### Added
+
+- **RTK-Lite Lossless Tool Output Compressor ([`core/token_saver.py`](../core/token_saver.py)):**
+  - Implemented deterministic, stateless lossless compression for `role == "tool"` messages via [`compress_tool_output(content: str, *, enabled: bool = True) -> str`](../core/token_saver.py#L457-L475) and [`sanitize_tool_messages(messages: list[dict[str, Any]], *, enabled: bool = True, headers: Mapping[str, str] | None = None) -> list[dict[str, Any]]`](../core/token_saver.py#L478-L494) (aliased as [`filter_tool_messages`](../core/token_saver.py#L498)).
+  - Added [`should_enable_token_saver(headers: Mapping[str, str] | None = None) -> bool`](../core/token_saver.py#L355-L372) to support case-insensitive per-request opt-out via the `X-Token-Saver` HTTP header (`"off"`, `"false"`, `"0"`, `"disabled"`, `"no"`), guaranteeing 100% byte-for-byte identity when disabled.
+  - Added [`compress_git_diff(text: str) -> str`](../core/token_saver.py#L391-L421) to strip non-semantic `index <hash>..<hash>` headers and trailing horizontal padding from unified and `git diff` blocks while preserving file headers (`diff --git`, `--- a/...`, `+++ b/...`), `@@ ... @@` hunk headers, `+`/`-`/context lines, and unprefixed blank lines inside hunks so hunk line counts remain exact.
+  - Added [`compress_grep_find_ls(text: str) -> str`](../core/token_saver.py#L424-L431) to collapse multi-space column padding in `ls -l` and `total <N>` lines, strip redundant leading `./` prefixes from `find` and `grep` paths, and collapse consecutive duplicate lines.
+  - Added [`compress_test_logs(text: str) -> str`](../core/token_saver.py#L447-L454), [`deduplicate_lines(text: str) -> str`](../core/token_saver.py#L434-L439) (aliased as [`deduplicate_consecutive_lines`](../core/token_saver.py#L442-L444)), [`normalize_whitespace_and_blank_lines(text: str) -> str`](../core/token_saver.py#L382-L388), and [`strip_ansi_codes(text: str) -> str`](../core/token_saver.py#L375-L379) to strip terminal ANSI escape sequences, collapse spinner frames, progress bars, and consecutive duplicate log lines while preserving 100% of error, failure, and stack traceback lines (`Traceback (most recent call last):`, `AssertionError`, `ERROR`, `FAIL`, `FAILED`, `FATAL`, `CRITICAL`, `PANIC`, `Exception`, `File "...", line N`, and `E   ...`).
+- **Recursive JSON Schema Sanitizer & Union Flattener ([`core/schema_sanitizer.py`](../core/schema_sanitizer.py)):**
+  - Defined [`UNSUPPORTED_SCHEMA_KEYS`](../core/schema_sanitizer.py#L25-L48) (`frozenset` of the exact 20 JSON Schema meta-keys rejected by `cloudcode-pa` `v1internal`: `additionalProperties`, `$schema`, `$id`, `$ref`, `$defs`, `definitions`, `examples`, `patternProperties`, `minLength`, `maxLength`, `minimum`, `maximum`, `multipleOf`, `pattern`, `format`, `minItems`, `maxItems`, `uniqueItems`, `minProperties`, `maxProperties`).
+  - Implemented [`clean_json_schema(schema: dict[str, Any]) -> dict[str, Any]`](../core/schema_sanitizer.py#L173-L194) to recursively strip all 20 unsupported meta-keys at arbitrary nesting depths while preserving user-defined tool parameter names inside `properties` mappings even when named `format`, `pattern`, `minimum`, or `examples`.
+  - Implemented [`flatten_unions(schema: dict[str, Any]) -> dict[str, Any]`](../core/schema_sanitizer.py#L308-L335) to convert `type: [...]` arrays and `anyOf` / `oneOf` union branches into concrete Gemini-compatible types with `nullable: True`, merging `properties` and intersecting `required` sets across object union branches, and recursing into both `dict` and `list[dict]` tuple-validation `items`.
+- **Dual Zero-Required & History Replay Fix — ADR-05 ([`core/schema_sanitizer.py`](../core/schema_sanitizer.py)):**
+  - Implemented [`apply_zero_required_fix(parameters: dict[str, Any]) -> tuple[dict[str, Any], bool]`](../core/schema_sanitizer.py#L363-L392) to resolve `cloudcode-pa` post-thought `functionCall` stalls when `required` is empty (`[]`):
+    - **Case 1 (Zero properties, `properties: {}`):** Injects `"_step": {"type": "string", "description": "Internal step tracker"}` and sets `required = ["_step"]`, returning `(params, True)`.
+    - **Case 2 (Optional properties exist, `required: []`):** Promotes the first existing property in `properties` to `required` with `nullable: True` and appends `' (Optional, default: "")'` to its description without injecting `_step`, returning `(params, False)`.
+  - Added [`strip_step_from_args(args: dict[str, Any] | None) -> dict[str, Any]`](../core/schema_sanitizer.py#L395-L401) and [`reinject_step_to_args(args: dict[str, Any] | None, *, tool_had_zero_properties: bool = True) -> dict[str, Any]`](../core/schema_sanitizer.py#L404-L417) to strip synthetic `_step` arguments before returning tool calls to the client and re-hydrate `{"_step": "done"}` in historical `functionCall.args` during multi-turn replay.
+  - Added end-to-end tool wrappers [`sanitize_parameters_schema(parameters: dict[str, Any] | None) -> dict[str, Any]`](../core/schema_sanitizer.py#L425-L431), [`sanitize_tool(tool: dict[str, Any]) -> dict[str, Any]`](../core/schema_sanitizer.py#L434-L455), and [`sanitize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]`](../core/schema_sanitizer.py#L458-L462) supporting both OpenAI `{"type": "function", "function": {...}}` and Gemini `{"functionDeclarations": [...]}` formats without mutating caller inputs.
+- **Public Package Exports ([`core/__init__.py`](../core/__init__.py)):**
+  - Exported all 23 Level 1 constants and functions from [`core/__init__.py`](../core/__init__.py#L31-L55) via `__all__`.
+
+### Security
+
+- **WAF System Prompt Shield — ADR-04 ([`core/schema_sanitizer.py`](../core/schema_sanitizer.py)):**
+  - Implemented [`sanitize_system_prompt_text(text: str) -> str`](../core/schema_sanitizer.py#L83-L100) and [`sanitize_messages_waf(messages: list[dict[str, Any]]) -> list[dict[str, Any]]`](../core/schema_sanitizer.py#L131-L143) (aliased as [`sanitize_system_prompts`](../core/schema_sanitizer.py#L146)) to neutralize Google Cloud ESF/WAF signatures in `system` and `developer` messages (`str` and multipart `list[dict]`) that trigger false `429 RESOURCE_EXHAUSTED` rejections.
+  - Rewrites `<system-conventions>` / `</system-conventions>` tags to `<conventions>` / `</conventions>` and isolates `RFC 2119` directive lines with blank lines (`\n\n`) while leaving `user`, `assistant`, and `tool` messages byte-for-byte untouched.
+
+### Fixed
+
+- Prevented false-positive `git diff` classification in [`core/token_saver.py`](../core/token_saver.py#L37-L40) when pytest failure logs contain incidental `@@ -1,2 +1,2 @@` assertion diff markers by requiring authentic `diff --git a/... b/...` or `--- a/...\n+++ b/...` headers in [`_is_git_diff_text`](../core/token_saver.py#L117-L119).
+- Preserved unprefixed blank lines inside unified diff hunks in [`_format_git_diff_line`](../core/token_saver.py#L167-L169) so consecutive empty context lines are not collapsed, preventing hunk line-count corruption.
+- Eliminated orphaned `[... repeated N times ...]` tags in [`_collapse_consecutive_identical_lines`](../core/token_saver.py#L288-L291) when preceding spinner or progress bar lines are filtered out.
+- Preserved natural English prose containing `RFC 2119` (such as `"Keywords are interpreted as described in RFC 2119: MUST, REQUIRED"`) on a single line in [`sanitize_system_prompt_text`](../core/schema_sanitizer.py#L62-L65) by only splitting inline `RFC 2119` clauses when immediately preceded by a tag boundary (`>`) or sentence/clause punctuation (`:`, `.`, `;`, `!`).
+
+### Verified
+
+- **Verification Gate 2 ([`tests/test_level1_gate2.py`](../tests/test_level1_gate2.py)):**
+  - Added 20 unit and parametrized test cases in [`tests/test_level1_gate2.py`](../tests/test_level1_gate2.py) verifying Level 1 schema sanitization, union flattening, ADR-05 Case 1 & Case 2 zero-required handling, ADR-04 WAF shielding, RTK-Lite lossless compression (`>= 20%` reduction on padded `git diff` blocks), 100% error/traceback preservation, caller input immutability, and `X-Token-Saver: off` byte-for-byte identity.
+  - Combined test suite execution across [`tests/test_level0_gate1.py`](../tests/test_level0_gate1.py) (19 tests) and [`tests/test_level1_gate2.py`](../tests/test_level1_gate2.py) (20 tests): **39 passed**.
+
+---
+
+## [0.1.0] - 2026-10-16
+
+### Added
+
+- **Level 0 Configuration, State Models, and Storage ([`config/settings.py`](../config/settings.py), [`config/accounts.json`](../config/accounts.json), [`requirements.txt`](../requirements.txt)):**
+  - Configured mathematical scheduling constants (`DELTA_BASE`, `OAUTH_MAX_CONCURRENCY_DEFAULT = 3`, `WEB_MAX_CONCURRENCY_DEFAULT = 2`, `WEB_MIN_START_INTERVAL_S = 0.5`, `WEB_FAST_REQUEST_THRESHOLD_S = 1.0`, `WEB_MIN_INTERVAL_S = 0.6`, `WEB_JITTER_RANGE_S = (0.4, 0.8)`, `SESSION_AFFINITY_MULTIPLIER = 1.35`, `SESSION_AFFINITY_MAX_CONTEXT_CHARS = 120_000`, `REHYDRATION_TIER2_MAX_CHARS = 60_000`) and longest-prefix model weight lookup [`get_model_base_delta(model_name: str) -> float`](../config/settings.py#L85-L110) as specified in [`docs/founditon/01_data_schemas_and_state.md`](founditon/01_data_schemas_and_state.md) and [`docs/founditon/03_scheduling_and_control_spec.md`](founditon/03_scheduling_and_control_spec.md).
+  - Implemented Pydantic v2 structural contracts ([`OAuthAccount`](../config/settings.py#L151-L196), [`WebAccount`](../config/settings.py#L249-L353), [`AccountsConfig`](../config/settings.py#L356-L362)) with isolated `PrivateAttr` runtime counters and `asyncio.Lock` instances excluded from JSON serialization.
+  - Implemented [`AccountsStateRegistry`](../config/settings.py#L372-L488) as the in-memory Single Source of Truth (ADR-02) and [`save_accounts_snapshot`](../config/settings.py#L521-L546) protected by `accounts_file_lock` for atomic `.tmp` + `os.replace()` persistence.
+  - Implemented [`LMDBStore`](../config/settings.py#L561-L683) managing `db_sessions` and `db_signatures` tables with account-scoped session pruning.
+- **Verification Gate 1 ([`tests/test_level0_gate1.py`](../tests/test_level0_gate1.py)):**
+  - Added 19 unit, parametrized, and 50-task concurrency stress tests verifying Level 0 state management, atomic persistence, and LMDB durability.

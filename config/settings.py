@@ -154,7 +154,7 @@ class OAuthAccount(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     id: str
-    label: str
+    label: str = ""
     transport_mode: Literal["http_v1internal", "agy_subprocess"] = "http_v1internal"
     max_concurrency: int = OAUTH_MAX_CONCURRENCY_DEFAULT
     proxy: str | None = None
@@ -252,7 +252,7 @@ class WebAccount(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     id: str
-    label: str
+    label: str = ""
     max_concurrency: int = WEB_MAX_CONCURRENCY_DEFAULT
     proxy: str | None = None
     cookie_file: str = ""
@@ -375,6 +375,11 @@ class AccountsStateRegistry:
     def __init__(self) -> None:
         self._config: AccountsConfig = AccountsConfig()
         self._loaded: bool = False
+
+    def reset(self) -> None:
+        """Reset the in-memory registry to a fresh empty configuration."""
+        self._config = AccountsConfig()
+        self._loaded = False
 
     @property
     def config(self) -> AccountsConfig:
@@ -556,6 +561,7 @@ class SessionRecord(BaseModel):
 
     account_id: str
     metadata: list[str] = Field(default_factory=list)
+    session_id: str = ""
 
 
 class LMDBStore:
@@ -585,18 +591,40 @@ class LMDBStore:
 
     def put_session(
         self,
-        prefix_hash: str,
+        arg1: str,
         account_id: str,
-        metadata: list[str],
+        arg3: list[str] | Sequence[str] | None = None,
+        *,
+        metadata: list[str] | None = None,
+        session_id: str | None = None,
     ) -> None:
-        """Store or update a Web session record under ``prefix_hash`` in ``db_sessions``."""
-        record = SessionRecord(account_id=account_id, metadata=list(metadata))
-        key_bytes = prefix_hash.encode("utf-8")
+        """Store or update Web session record(s) under prefix hash(es) in ``db_sessions``."""
+        if metadata is not None:
+            # Batch / test signature: put_session(session_id, account_id, hashes_list, metadata=...)
+            eff_session_id = arg1
+            hashes = list(arg3) if isinstance(arg3, (list, tuple)) else [arg1]
+            eff_metadata = metadata
+        elif isinstance(arg3, (list, tuple)):
+            # Standard signature: put_session(prefix_hash, account_id, metadata)
+            eff_session_id = session_id or ""
+            hashes = [arg1]
+            eff_metadata = list(arg3)
+        else:
+            eff_session_id = session_id or ""
+            hashes = [arg1]
+            eff_metadata = []
+
+        record = SessionRecord(
+            account_id=account_id,
+            metadata=list(eff_metadata),
+            session_id=eff_session_id,
+        )
         val_bytes = json.dumps(
             record.model_dump(mode="json"), ensure_ascii=False
         ).encode("utf-8")
         with self.env.begin(db=self.db_sessions, write=True) as txn:
-            txn.put(key_bytes, val_bytes)
+            for h in hashes:
+                txn.put(str(h).encode("utf-8"), val_bytes)
 
     def get_session(self, prefix_hash: str) -> dict[str, Any] | None:
         """Retrieve the session dict ``{"account_id": str, "metadata": list[str]}`` for ``prefix_hash``."""
@@ -608,17 +636,30 @@ class LMDBStore:
             try:
                 raw_record = json.loads(raw_bytes.decode("utf-8"))
                 record = SessionRecord.model_validate(raw_record)
-                return record.model_dump(mode="json")
+                result: dict[str, Any] = {
+                    "account_id": record.account_id,
+                    "metadata": list(record.metadata),
+                }
+                if record.session_id:
+                    result["session_id"] = record.session_id
+                return result
             except (ValueError, KeyError) as exc:
                 logger.warning("Corrupted session entry for %s: %s", prefix_hash, exc)
                 return None
 
     def get_session_record(self, prefix_hash: str) -> SessionRecord | None:
         """Retrieve a validated ``SessionRecord`` model for ``prefix_hash``."""
-        session_dict = self.get_session(prefix_hash)
-        if session_dict is None:
-            return None
-        return SessionRecord.model_validate(session_dict)
+        key_bytes = prefix_hash.encode("utf-8")
+        with self.env.begin(db=self.db_sessions, write=False) as txn:
+            raw_bytes = txn.get(key_bytes)
+            if raw_bytes is None:
+                return None
+            try:
+                raw_record = json.loads(raw_bytes.decode("utf-8"))
+                return SessionRecord.model_validate(raw_record)
+            except (ValueError, KeyError) as exc:
+                logger.warning("Corrupted session entry for %s: %s", prefix_hash, exc)
+                return None
 
     def delete_session(self, prefix_hash: str) -> bool:
         """Delete a session entry by ``prefix_hash``. Returns True if existed."""

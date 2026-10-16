@@ -282,6 +282,9 @@ def compute_messages_char_length(
     return total_chars
 
 
+calculate_messages_char_length = compute_messages_char_length
+
+
 # ============================================================================
 # 4. Adaptive Session Mode & Idle Chat Garbage Collection (60-Min TTL)
 # ============================================================================

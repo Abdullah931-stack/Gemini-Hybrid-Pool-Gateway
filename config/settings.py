@@ -19,6 +19,26 @@ import os
 from pathlib import Path
 import tempfile
 from typing import Any, Literal
+import sys
+from importlib.machinery import ExtensionFileLoader
+from importlib.util import spec_from_file_location
+
+if sys.platform == "win32":
+    class _WinAmd64PydFinder:
+        @classmethod
+        def find_spec(cls, fullname: str, path: Any = None, target: Any = None) -> Any:
+            search_paths = path if path is not None else sys.path
+            name = fullname.rpartition(".")[2]
+            for p in search_paths:
+                candidate = os.path.join(p, f"{name}.cp311-win_amd64.pyd")
+                if os.path.isfile(candidate):
+                    return spec_from_file_location(
+                        fullname, candidate, loader=ExtensionFileLoader(fullname, candidate)
+                    )
+            return None
+
+    if not any(getattr(f, "__name__", "") == "_WinAmd64PydFinder" for f in sys.meta_path):
+        sys.meta_path.insert(0, _WinAmd64PydFinder)
 
 import lmdb
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
@@ -244,6 +264,7 @@ class WebUsage(BaseModel):
     weekly_pct: float = 0.0
     weekly_reset_at: int | None = None
     last_synced_at: int | None = None
+    tier: str = "FREE"
 
 
 class WebAccount(BaseModel):
@@ -263,6 +284,15 @@ class WebAccount(BaseModel):
     cooldown_until: int | None = None
     consecutive_errors: int = 0
     last_error_reason: str | None = None
+
+    @property
+    def tier(self) -> str:
+        """Subscription tier (e.g. 'FREE', 'PRO', 'ULTRA') from usage sync."""
+        return self.usage.tier
+
+    @tier.setter
+    def tier(self, value: str) -> None:
+        self.usage.tier = value
 
     # In-memory runtime state (never serialized to disk)
     _active_requests: int = PrivateAttr(default=0)

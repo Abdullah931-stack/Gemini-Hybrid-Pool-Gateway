@@ -4,6 +4,39 @@ All notable changes to the **Gemini-Hybrid-Pool-Gateway** (`v3.2` architecture) 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-10-17
+
+### Added
+
+- **OAuth CLI Channel & Protocol Gateway — ADR-04, ADR-05, ADR-06 ([`core/oauth_cli_channel.py`](../core/oauth_cli_channel.py)):**
+  - Implemented production `v1internal` request envelope builder [`build_v1internal_envelope`](../core/oauth_cli_channel.py#L481-L542) strictly prohibiting `"requestType": "agent"` (**ADR-04**) to eliminate false 429 quota exhaustion errors.
+  - Implemented multi-turn role converter [`convert_messages_to_v1internal_contents`](../core/oauth_cli_channel.py#L307-L473) re-injecting `_step: "done"` into historical `functionCall.args` for zero-property tools (**ADR-05**), fetching cryptographic `thoughtSignature` from `LMDBStore.db_signatures` or defaulting to `skip_thought_signature_validator` (**ADR-06**), nesting tool output images inside `functionResponse.parts` as `inlineData`, and applying the Post-Assembly Model-Turn Guard.
+  - Implemented SSE demuxer and OpenAI chunk stream transformer [`transform_candidate_to_openai_chunks`](../core/oauth_cli_channel.py#L571-L690) streaming reasoning thoughts as `delta.reasoning_content`, regular text as `delta.content`, and tool calls as `delta.tool_calls` (stripping synthetic `_step` and automatically persisting emitted `thoughtSignature` tokens to `LMDBStore.db_signatures` under `tool_call_id`).
+  - Implemented high-level client [`OAuthCLIChannel`](../core/oauth_cli_channel.py#L820-L959) supporting both HTTP/2 streaming via `httpx.AsyncClient` and subprocess streaming via `AgySubprocessTransport`.
+- **Web Cookie Pool Channel & Lookahead Parser — ADR-09 ([`core/web_channel.py`](../core/web_channel.py)):**
+  - Implemented [`MultiToolLookaheadParser`](../core/web_channel.py#L305-L536) state machine enforcing **ADR-09**: zero post-tool delimiter or fence content leakage, lookahead token buffering (`capacity=64`) across fragmented chunk boundaries, and extraction of sequential multi-tool invocations with unique `call_{uuid}` IDs and 0-based indices.
+  - Implemented context-weighted 5-hour quota delta accounting [`compute_context_scaled_delta_5h`](../core/web_channel.py#L542-L557): $\Delta_{5h}(m, L) = \Delta_{\text{base}}(m) \times (1.0 + 0.25 \times (L / 25000))$, capped at 100.0.
+  - Implemented streaming execution wrapper [`execute_web_channel_stream`](../core/web_channel.py#L613-L715) dispatching live thoughts immediately to avoid TTFT timeouts, tracking in-flight concurrency, and updating `account.optimistic_5h_delta` and `account.last_completed_timestamp` upon stream completion.
+  - Implemented channel adapter [`WebChannel`](../core/web_channel.py#L722-L777) integrating with `WebSessionManager`.
+- **Proactive Usage Monitor & Anti-Drift Engine — ADR-02 ([`core/usage_monitor.py`](../core/usage_monitor.py)):**
+  - Implemented duration string parser [`parse_quota_reset_delay`](../core/usage_monitor.py#L166-L209) and deep extractor [`extract_quota_reset_delay_from_error`](../core/usage_monitor.py#L211-L263) supporting diverse time units (`"120s"`, `"5m"`, `"2h"`, `"1h30m"`, numeric values).
+  - Implemented intelligent HTTP 429 evaluator [`classify_and_handle_oauth_429`](../core/usage_monitor.py#L265-L324) putting accounts with reset delays into `COOLDOWN` and atomically persisting state to disk, while treating delay-less 429s as transient bursts without long cooldowns.
+  - Implemented permanent suspension handler [`handle_account_suspension`](../core/usage_monitor.py#L342-L366) and pattern matcher [`is_suspension_error`](../core/usage_monitor.py#L331-L340) for Terms of Service rejections and disabled accounts.
+  - Implemented Google RPC `jSf9Qc` response parser [`parse_jsf9qc_usage_response`](../core/usage_monitor.py#L385-L567) with `)]}'\n` XSSI stripping, quota percentage extraction, and subscription tier mapping (`FREE`, `PRO`, `ULTRA`).
+  - Implemented **ADR-02** drift-safe reset zeroing [`check_and_apply_drift_safe_resets`](../core/usage_monitor.py#L574-L619) zeroing optimistic deltas whenever `now >= reset_time`, and [`apply_web_usage_update`](../core/usage_monitor.py#L621-L650) clearing local deltas on fresh live queries.
+  - Implemented request metrics recorder [`record_successful_request`](../core/usage_monitor.py#L812-L853) tracking Exponential Moving Average (EMA) latency ($\alpha = 0.2$), and central maintenance pass [`sync_all_registered_accounts`](../core/usage_monitor.py#L855-L943).
+  - Implemented service facade [`UsageMonitor`](../core/usage_monitor.py#L946-L1070).
+- **Package Re-exports ([`core/__init__.py`](../core/__init__.py)):**
+  - Exported all 121 public Level 1, Level 2, and Level 3 symbols in `__all__`, resolving naming collisions (`format_web_openai_sse_event`) and submodule access hygiene (`default_oauth_cli_channel`).
+
+### Verified
+
+- **Verification Gate 4 ([`tests/test_level3_gate4.py`](../tests/test_level3_gate4.py), [`tests/test_oauth_cli_channel.py`](../tests/test_oauth_cli_channel.py), [`tests/test_web_channel.py`](../tests/test_web_channel.py), [`tests/test_usage_monitor.py`](../tests/test_usage_monitor.py)):**
+  - Added 28 comprehensive integration test cases in [`tests/test_level3_gate4.py`](../tests/test_level3_gate4.py) alongside 53 unit tests in the channel and monitor test suites (**81 Level 3 tests total**).
+  - Verified 100% pass rate across entire repository: **210/210 passed in 7.54s** with zero regressions.
+
+---
+
 ## [0.1.2] - 2026-10-17
 
 ### Added

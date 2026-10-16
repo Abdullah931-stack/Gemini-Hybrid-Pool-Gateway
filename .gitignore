@@ -50,6 +50,8 @@ htmlcov/
 data.mdb
 lock.mdb
 temp_histories/
+config/lmdb_data/
+lmdb_data/
 
 # Sensitive Environment Configurations
 .env

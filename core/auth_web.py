@@ -31,7 +31,10 @@ import tempfile
 import time
 from typing import Any
 
-import browser_cookie3
+try:
+    import browser_cookie3
+except Exception:
+    browser_cookie3 = None  # type: ignore[assignment]
 from gemini_webapi import GeminiClient
 
 from config.settings import (

@@ -30,6 +30,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 from typing import Any, Final, Literal
@@ -178,13 +179,64 @@ def _canonicalize_tool_arguments(raw_args: Any) -> str:
     return str(raw_args or "")
 
 
+_TOOL_CALL_TAG_RE = re.compile(
+    r"<tool_call(?:\s+[^>]*)?>(.*?)</tool_call>",
+    re.DOTALL | re.IGNORECASE,
+)
+_CODE_FENCE_CLEANUP_RE = re.compile(
+    r"```(?:xml|json)?\s*```",
+    re.IGNORECASE,
+)
+
+
+def _extract_embedded_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Extract <tool_call> blocks from assistant message content and return (cleaned_text, tool_calls)."""
+    if not isinstance(text, str) or "<tool_call" not in text.lower():
+        return text, []
+
+    tool_calls: list[dict[str, Any]] = []
+    for match in _TOOL_CALL_TAG_RE.finditer(text):
+        raw_payload = match.group(1).strip()
+        try:
+            parsed = json.loads(raw_payload)
+            items = parsed if isinstance(parsed, list) else [parsed]
+            for item in items:
+                if isinstance(item, dict):
+                    name = item.get("name") or (
+                        item.get("function", {}).get("name")
+                        if isinstance(item.get("function"), dict)
+                        else ""
+                    )
+                    args = item.get("arguments") or (
+                        item.get("function", {}).get("arguments")
+                        if isinstance(item.get("function"), dict)
+                        else ""
+                    )
+                    tool_calls.append(
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {
+                                "name": str(name or ""),
+                                "arguments": _canonicalize_tool_arguments(args),
+                            },
+                        }
+                    )
+        except Exception:
+            continue
+
+    cleaned = _TOOL_CALL_TAG_RE.sub("", text)
+    cleaned = _CODE_FENCE_CLEANUP_RE.sub("", cleaned).strip()
+    return cleaned, tool_calls
+
+
 def _normalize_single_tool_call(tool_call: Mapping[str, Any]) -> dict[str, Any]:
     """Canonicalize a single OpenAI-style tool call mapping for deterministic hashing."""
     func_raw = tool_call.get("function")
     func_map = func_raw if isinstance(func_raw, Mapping) else {}
     raw_args = func_map.get("arguments", tool_call.get("arguments", ""))
     return {
-        "id": str(tool_call.get("id") or ""),
+        "id": "",
         "type": str(tool_call.get("type") or "function"),
         "function": {
             "name": str(func_map.get("name") or tool_call.get("name") or ""),
@@ -219,8 +271,16 @@ def normalize_message_for_hash(message: Mapping[str, Any]) -> str:
     else:
         canonical_content = _extract_text_from_content(raw_content)
 
-    canonical_payload: dict[str, Any] = {"role": role, "content": canonical_content}
     tool_calls = _normalize_tool_calls_list(message.get("tool_calls"))
+
+    # H-3.1: If assistant message has embedded <tool_call> in content, extract and unify tool_calls
+    if role in ("assistant", "model") and isinstance(canonical_content, str) and "<tool_call" in canonical_content.lower():
+        cleaned_content, extracted_calls = _extract_embedded_tool_calls(canonical_content)
+        canonical_content = cleaned_content
+        if not tool_calls and extracted_calls:
+            tool_calls = extracted_calls
+
+    canonical_payload: dict[str, Any] = {"role": role, "content": canonical_content}
     if tool_calls:
         canonical_payload["tool_calls"] = tool_calls
 
@@ -453,11 +513,15 @@ def find_longest_prefix_session(
     *,
     lmdb_store: LMDBStore | None = None,
     require_delta: bool = False,
+    target_account_id: str | None = None,
+    excluded_account_ids: Set[str] | Sequence[str] | None = None,
+    **kwargs: Any,
 ) -> PrefixMatchResult | None:
     """Find the longest prefix of ``messages`` stored in LMDB ``db_sessions``.
 
     When ``require_delta=True``, only prefixes strictly shorter than ``len(messages)``
     are considered so that ``delta_messages`` is guaranteed to be non-empty.
+    When ``target_account_id`` is supplied, only matches belonging to that account are returned.
     """
     if not messages:
         return None
@@ -465,11 +529,16 @@ def find_longest_prefix_session(
     store = lmdb_store if lmdb_store is not None else get_lmdb_store()
     prefix_hashes = compute_prefix_hashes(messages)
     max_index = len(prefix_hashes) - 2 if require_delta else len(prefix_hashes) - 1
+    excluded_set = set(excluded_account_ids) if excluded_account_ids is not None else None
 
     for idx in range(max_index, -1, -1):
         candidate_hash = prefix_hashes[idx]
         record = store.get_session_record(candidate_hash)
         if record is not None:
+            if target_account_id is not None and record.account_id != target_account_id:
+                continue
+            if excluded_set is not None and record.account_id in excluded_set:
+                continue
             matched_count = idx + 1
             return PrefixMatchResult(
                 prefix_hash=candidate_hash,
@@ -489,6 +558,10 @@ def get_preferred_session_account(
     lmdb_store: LMDBStore | None = None,
     system_prompt: str = "",
     tools: Sequence[Mapping[str, Any]] | None = None,
+    max_chars: int = SESSION_AFFINITY_MAX_CONTEXT_CHARS,
+    excluded_account_ids: Set[str] | Sequence[str] | None = None,
+    env: Any = None,
+    **kwargs: Any,
 ) -> tuple[str | None, int]:
     """Return ``(preferred_account_id, total_chars)`` if an active session fits affinity cap.
 
@@ -498,10 +571,15 @@ def get_preferred_session_account(
     total_chars = compute_messages_char_length(
         messages, system_prompt=system_prompt, tools=tools
     )
-    if total_chars > SESSION_AFFINITY_MAX_CONTEXT_CHARS:
+    if total_chars >= max_chars:
         return None, total_chars
 
-    matched = find_longest_prefix_session(messages, lmdb_store=lmdb_store)
+    store = lmdb_store if lmdb_store is not None else (env if env is not None else None)
+    matched = find_longest_prefix_session(
+        messages,
+        lmdb_store=store,
+        excluded_account_ids=excluded_account_ids,
+    )
     if matched is None:
         return None, total_chars
     return matched.account_id, total_chars
@@ -672,6 +750,7 @@ def _find_best_prefix_match(
     sanitized_messages: Sequence[Mapping[str, Any]],
     *,
     lmdb_store: LMDBStore,
+    target_account_id: str | None = None,
 ) -> PrefixMatchResult | None:
     """Locate the longest prefix match in ``db_sessions`` preferring non-empty deltas."""
     for candidate_seq in (raw_messages, sanitized_messages):
@@ -679,6 +758,7 @@ def _find_best_prefix_match(
             candidate_seq,
             lmdb_store=lmdb_store,
             require_delta=True,
+            target_account_id=target_account_id,
         )
         if match_with_delta is not None:
             matched_idx = match_with_delta.matched_count
@@ -691,6 +771,7 @@ def _find_best_prefix_match(
         raw_messages,
         lmdb_store=lmdb_store,
         require_delta=False,
+        target_account_id=target_account_id,
     )
 
 
@@ -893,7 +974,12 @@ def build_rehydration_plan(
     )
     full_prefix_hash = compute_prefix_hashes(effective_messages)[-1]
 
-    matched = _find_best_prefix_match(effective_messages, sanitized_messages, lmdb_store=store)
+    matched = _find_best_prefix_match(
+        effective_messages,
+        sanitized_messages,
+        lmdb_store=store,
+        target_account_id=effective_account_id,
+    )
     if (
         matched is not None
         and effective_account_id is not None
@@ -1011,11 +1097,20 @@ def _start_client_chat_session(
         p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
     )
 
+    eff_model = model
+    if isinstance(model, str) and hasattr(client, "resolve_model"):
+        try:
+            from core.model_registry import parse_model_and_effort, resolve_web_model
+            base_m, eff = parse_model_and_effort(model)
+            eff_model = resolve_web_model(client, base_m, reasoning_effort=eff)
+        except Exception:
+            eff_model = model
+
     call_kwargs: dict[str, Any] = {}
     if accepts_var_kw or "metadata" in sig.parameters:
         call_kwargs["metadata"] = plan.resume_metadata
-    if model is not None and (accepts_var_kw or "model" in sig.parameters):
-        call_kwargs["model"] = model
+    if eff_model is not None and (accepts_var_kw or "model" in sig.parameters):
+        call_kwargs["model"] = eff_model
     if accepts_var_kw or "temporary" in sig.parameters:
         call_kwargs["temporary"] = plan.temporary
 

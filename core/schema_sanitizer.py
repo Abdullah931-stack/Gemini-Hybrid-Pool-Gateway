@@ -17,9 +17,10 @@ Implements Level 1 (Data & Protocol Plane) of the Gemini-Hybrid-Pool-Gateway (v3
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import copy
 import re
-from typing import Any
+from typing import Any, Dict, Optional, Set, Tuple
 
 # Exact 20 JSON Schema meta-keys rejected by cloudcode-pa (v1internal)
 UNSUPPORTED_SCHEMA_KEYS: frozenset[str] = frozenset(
@@ -147,31 +148,83 @@ sanitize_system_prompts = sanitize_messages_waf
 
 
 # ============================================================================
-# 2. Recursive JSON Schema Cleaner (20 Unsupported Keys)
+# 2. Recursive JSON Schema Cleaner (20 Unsupported Keys & Local $ref Inlining)
 # ============================================================================
 
 
-def _clean_properties_map(properties: dict[str, Any]) -> dict[str, Any]:
+def _extract_defs_from_schema(
+    schema: dict[str, Any],
+    existing_defs: dict[str, dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Collect local ``$defs`` and ``definitions`` mappings from ``schema``."""
+    active_defs: dict[str, dict[str, Any]] = (
+        dict(existing_defs) if existing_defs is not None else {}
+    )
+    for defs_key in ("$defs", "definitions"):
+        raw_defs = schema.get(defs_key)
+        if isinstance(raw_defs, dict):
+            for def_name, def_schema in raw_defs.items():
+                if isinstance(def_schema, dict):
+                    active_defs[str(def_name)] = def_schema
+    return active_defs
+
+
+def _resolve_local_ref_target(
+    ref_val: str,
+    active_defs: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Resolve a local ``#/$defs/<Name>`` or ``#/definitions/<Name>`` reference."""
+    for prefix in ("#/$defs/", "#/definitions/"):
+        if ref_val.startswith(prefix):
+            def_name = ref_val[len(prefix) :]
+            target = active_defs.get(def_name)
+            if isinstance(target, dict):
+                return target
+    return None
+
+
+def _clean_properties_map(
+    properties: dict[str, Any],
+    *,
+    root_defs: dict[str, dict[str, Any]],
+    seen_refs: set[str],
+) -> dict[str, Any]:
     """Preserve user-defined parameter names in ``properties`` while cleaning their schemas."""
     cleaned_props: dict[str, Any] = {}
     for prop_name, prop_schema in properties.items():
         if isinstance(prop_schema, dict):
-            cleaned_props[prop_name] = clean_json_schema(prop_schema)
+            cleaned_props[prop_name] = clean_json_schema(
+                prop_schema,
+                _root_defs=root_defs,
+                _seen_refs=seen_refs,
+            )
         else:
             cleaned_props[prop_name] = copy.deepcopy(prop_schema)
     return cleaned_props
 
 
-def _clean_schema_list(items: list[Any]) -> list[Any]:
+def _clean_schema_list(
+    items: list[Any],
+    *,
+    root_defs: dict[str, dict[str, Any]],
+    seen_refs: set[str],
+) -> list[Any]:
     """Recursively clean all dictionary elements inside a schema list."""
     return [
-        clean_json_schema(element) if isinstance(element, dict) else copy.deepcopy(element)
+        clean_json_schema(element, _root_defs=root_defs, _seen_refs=seen_refs)
+        if isinstance(element, dict)
+        else copy.deepcopy(element)
         for element in items
     ]
 
 
-def clean_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Recursively remove the 20 unsupported ``cloudcode-pa`` meta-keys from ``schema``.
+def clean_json_schema(
+    schema: dict[str, Any],
+    *,
+    _root_defs: dict[str, dict[str, Any]] | None = None,
+    _seen_refs: Set[str] | None = None,
+) -> dict[str, Any]:
+    """Recursively inline local ``$ref`` definitions and remove the 20 unsupported meta-keys.
 
     Never deletes parameter names inside a ``properties`` mapping even if a parameter
     is named after a restricted keyword (such as ``format`` or ``pattern``).
@@ -179,18 +232,62 @@ def clean_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(schema, dict):
         return copy.deepcopy(schema)
 
+    active_defs = _extract_defs_from_schema(schema, _root_defs)
+    seen_refs: set[str] = set(_seen_refs) if _seen_refs is not None else set()
+
+    ref_val = schema.get("$ref")
+    had_unresolvable_ref = False
+    if isinstance(ref_val, str):
+        ref_target = _resolve_local_ref_target(ref_val, active_defs)
+        if ref_target is not None and ref_val not in seen_refs:
+            merged_schema = copy.deepcopy(ref_target)
+            for sibling_key, sibling_val in schema.items():
+                if sibling_key != "$ref":
+                    merged_schema[sibling_key] = copy.deepcopy(sibling_val)
+            return clean_json_schema(
+                merged_schema,
+                _root_defs=active_defs,
+                _seen_refs=seen_refs | {ref_val},
+            )
+        had_unresolvable_ref = True
+    elif "$ref" in schema:
+        had_unresolvable_ref = True
+
     cleaned: dict[str, Any] = {}
     for key, val in schema.items():
         if key in UNSUPPORTED_SCHEMA_KEYS:
             continue
         if key == "properties" and isinstance(val, dict):
-            cleaned[key] = _clean_properties_map(val)
+            cleaned[key] = _clean_properties_map(
+                val,
+                root_defs=active_defs,
+                seen_refs=seen_refs,
+            )
         elif isinstance(val, dict):
-            cleaned[key] = clean_json_schema(val)
+            cleaned[key] = clean_json_schema(
+                val,
+                _root_defs=active_defs,
+                _seen_refs=seen_refs,
+            )
         elif isinstance(val, list):
-            cleaned[key] = _clean_schema_list(val)
+            cleaned[key] = _clean_schema_list(
+                val,
+                root_defs=active_defs,
+                seen_refs=seen_refs,
+            )
         else:
             cleaned[key] = copy.deepcopy(val)
+
+    if had_unresolvable_ref and "type" not in cleaned:
+        cleaned["type"] = "object"
+
+    if isinstance(cleaned.get("properties"), dict) and isinstance(cleaned.get("required"), list):
+        props_map = cleaned["properties"]
+        cleaned["required"] = [
+            req_key for req_key in cleaned["required"]
+            if isinstance(req_key, str) and req_key in props_map
+        ]
+
     return cleaned
 
 
@@ -372,12 +469,20 @@ def apply_zero_required_fix(parameters: dict[str, Any]) -> tuple[dict[str, Any],
     params = copy.deepcopy(parameters) if isinstance(parameters, dict) else {}
     params.setdefault("type", "object")
 
-    required = params.get("required")
-    if isinstance(required, list) and len(required) > 0:
+    raw_properties = params.get("properties")
+    properties = raw_properties if isinstance(raw_properties, dict) else {}
+
+    raw_required = params.get("required")
+    if isinstance(raw_required, list):
+        required = [r for r in raw_required if isinstance(r, str) and r in properties]
+        params["required"] = required
+    else:
+        required = []
+
+    if len(required) > 0:
         return params, False
 
-    properties = params.get("properties")
-    if not isinstance(properties, dict) or len(properties) == 0:
+    if len(properties) == 0:
         params["type"] = "object"
         params["properties"] = {
             _STEP_PROPERTY_NAME: {
@@ -422,12 +527,23 @@ def reinject_step_to_args(
 # ============================================================================
 
 
-def sanitize_parameters_schema(parameters: dict[str, Any] | None) -> dict[str, Any]:
-    """Run ``clean_json_schema``, ``flatten_unions``, and ``apply_zero_required_fix`` on ``parameters``."""
-    raw_params = parameters if isinstance(parameters, dict) else {}
+def sanitize_parameters_schema_with_meta(
+    schema: Optional[Mapping[str, Any]],
+) -> Tuple[Dict[str, Any], bool]:
+    """Sanitize ``schema`` and return ``(cleaned_schema, injected_step)``.
+
+    ``injected_step`` is ``True`` only when Case 1 injected ``_step`` into an
+    empty-properties schema.
+    """
+    raw_params = dict(schema) if isinstance(schema, Mapping) else {}
     cleaned = clean_json_schema(raw_params)
     flattened = flatten_unions(cleaned)
-    fixed, _ = apply_zero_required_fix(flattened)
+    return apply_zero_required_fix(flattened)
+
+
+def sanitize_parameters_schema(parameters: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    """Run ``clean_json_schema``, ``flatten_unions``, and ``apply_zero_required_fix`` on ``parameters``."""
+    fixed, _ = sanitize_parameters_schema_with_meta(parameters)
     return fixed
 
 
@@ -460,3 +576,21 @@ def sanitize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     if not tools:
         return []
     return [sanitize_tool(tool) for tool in tools]
+
+
+__all__ = [
+    "UNSUPPORTED_SCHEMA_KEYS",
+    "apply_zero_required_fix",
+    "clean_json_schema",
+    "flatten_unions",
+    "reinject_step_to_args",
+    "sanitize_messages_waf",
+    "sanitize_parameters_schema",
+    "sanitize_parameters_schema_with_meta",
+    "sanitize_system_prompt_text",
+    "sanitize_system_prompts",
+    "sanitize_tool",
+    "sanitize_tools",
+    "strip_step_from_args",
+]
+

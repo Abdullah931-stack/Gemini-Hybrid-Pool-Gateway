@@ -46,6 +46,8 @@ from config.settings import (
     get_lmdb_store,
     state_registry,
 )
+from core import auth_web as _auth_web
+from core.auth_web import web_session_manager as default_web_session_manager
 from core.hybrid_scheduler import (
     NoEligibleAccountError,
     apply_smart_pacing,
@@ -58,11 +60,13 @@ from core.model_registry import (
     unified_model_registry,
 )
 from core.oauth_cli_channel import OAuthCLIChannel
+from core.prefix_differ import compute_messages_char_length
 from core.usage_monitor import (
     UsageMonitor,
     classify_and_handle_oauth_429,
     handle_account_suspension,
     is_suspension_error,
+    record_successful_request,
 )
 from core.web_channel import WebChannel
 
@@ -85,6 +89,30 @@ class HandshakeFailedError(Exception):
 
 class ModelNotSupportedError(Exception):
     """Raised when the requested model is not supported by any account or channel."""
+
+
+class CompletionResponseDict(dict):
+    """OpenAI chat.completion dict that hides internal metadata keys from iteration/JSON
+    while still allowing direct ``result["_account_id"]`` / ``result["_channel"]`` lookup
+    for internal diagnostics and existing unit tests.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        internal_meta: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._internal_meta: dict[str, Any] = dict(internal_meta) if internal_meta else {}
+
+    def __getitem__(self, key: Any) -> Any:
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            if key in self._internal_meta:
+                return self._internal_meta[key]
+            raise
 
 
 # ============================================================================
@@ -185,6 +213,23 @@ def is_model_supported_in_gateway(
     return False
 
 
+def _filter_supported_kwargs(
+    callable_obj: Callable[..., Any],
+    kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Filter ``kwargs`` to keys accepted by ``callable_obj`` (or all if ``**kwargs`` is present)."""
+    try:
+        sig = inspect.signature(callable_obj)
+    except (ValueError, TypeError):
+        return dict(kwargs)
+
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return dict(kwargs)
+
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
 # ============================================================================
 # 3. Chained Stream Generator with Guaranteed Cleanup
 # ============================================================================
@@ -193,7 +238,7 @@ def is_model_supported_in_gateway(
 async def chain_async_iterators(
     buffered_chunks: Sequence[Any],
     active_stream: AsyncIterator[Any],
-    on_complete: Callable[[], Any] | None = None,
+    on_complete: Callable[..., Any] | None = None,
 ) -> AsyncIterator[Any]:
     """Yield buffered chunks first, then forward active_stream with guaranteed cleanup.
 
@@ -201,13 +246,34 @@ async def chain_async_iterators(
     whether the stream completes normally, breaks early, is cancelled, or raises.
     """
     callback_executed = False
+    completed_normally = False
 
-    async def _safe_cleanup() -> None:
+    async def _safe_cleanup(normal_completion: bool) -> None:
         nonlocal callback_executed
         if not callback_executed and on_complete is not None:
             callback_executed = True
             try:
-                res = on_complete()
+                try:
+                    sig = inspect.signature(on_complete)
+                    accepts_status = (
+                        len(sig.parameters) >= 1
+                        or any(
+                            p.kind
+                            in (
+                                inspect.Parameter.VAR_POSITIONAL,
+                                inspect.Parameter.POSITIONAL_ONLY,
+                                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            )
+                            for p in sig.parameters.values()
+                        )
+                    )
+                except (ValueError, TypeError):
+                    accepts_status = False
+
+                if accepts_status:
+                    res = on_complete(normal_completion)
+                else:
+                    res = on_complete()
                 if inspect.isawaitable(res):
                     await res
             except Exception as e:
@@ -218,8 +284,9 @@ async def chain_async_iterators(
             yield chunk
         async for chunk in active_stream:
             yield chunk
+        completed_normally = True
     finally:
-        await _safe_cleanup()
+        await _safe_cleanup(completed_normally)
 
 
 # ============================================================================
@@ -238,13 +305,17 @@ class FailoverController:
         oauth_channel: OAuthCLIChannel | None = None,
         web_channel: WebChannel | None = None,
         max_buffer_chunks: int = HANDSHAKE_MAX_BUFFER_CHUNKS,
+        web_session_manager: Any | None = None,
+        time_fn: Callable[[], float] = time.time,
     ) -> None:
         self.registry: AccountsStateRegistry = registry or state_registry
         self._lmdb_store: LMDBStore | None = lmdb_store
         self.usage_monitor: UsageMonitor = usage_monitor or UsageMonitor(self.registry)
         self._oauth_channel: OAuthCLIChannel | None = oauth_channel
         self._web_channel: WebChannel | None = web_channel
+        self._web_session_manager: Any | None = web_session_manager
         self.max_buffer_chunks: int = max_buffer_chunks
+        self._time_fn: Callable[[], float] = time_fn
 
     @property
     def lmdb_store(self) -> LMDBStore:
@@ -262,10 +333,163 @@ class FailoverController:
 
     @property
     def web_channel(self) -> WebChannel:
-        """Resolve active WebChannel instance."""
+        """Resolve active WebChannel instance wired with WebSessionManager (H-1.1)."""
         if self._web_channel is None:
-            self._web_channel = WebChannel(lmdb_store=self.lmdb_store)
+            session_mgr = (
+                self._web_session_manager
+                or getattr(_auth_web, "default_web_session_manager", None)
+                or default_web_session_manager
+            )
+            self._web_channel = WebChannel(
+                session_manager=session_mgr,
+                lmdb_store=self.lmdb_store,
+            )
         return self._web_channel
+
+    def _record_completion_success(
+        self,
+        account: OAuthAccount | WebAccount,
+        model: str,
+        messages: Sequence[Mapping[str, Any]] | Sequence[dict[str, Any]],
+        tools: Sequence[Mapping[str, Any]] | Sequence[dict[str, Any]] | None,
+        latency_ms: float,
+        end_ts: float,
+        *,
+        bypass_web_channel: bool = False,
+    ) -> None:
+        """Update latency EWMA, clear consecutive errors, and record optimistic deltas on success (H-1.3)."""
+        safe_latency = max(0.0, float(latency_ms))
+
+        if isinstance(account, OAuthAccount):
+            account.quota_state.consecutive_errors = 0
+            account.quota_state.last_error_reason = None
+        if hasattr(account, "consecutive_errors"):
+            account.consecutive_errors = 0
+        if hasattr(account, "last_error_reason"):
+            account.last_error_reason = None
+
+        if hasattr(account, "recent_latency_ms"):
+            prev = float(account.recent_latency_ms or 0.0)
+            account.recent_latency_ms = (
+                (0.3 * safe_latency + 0.7 * prev) if prev > 0.0 else safe_latency
+            )
+
+        if isinstance(account, WebAccount) and bypass_web_channel:
+            context_chars = compute_messages_char_length(messages, tools=tools)
+            record_successful_request(
+                account,
+                model,
+                safe_latency,
+                context_chars=context_chars,
+                now=end_ts,
+            )
+
+    async def _open_account_stream(
+        self,
+        account: OAuthAccount | WebAccount,
+        channel_type: Literal["oauth", "web"],
+        model: str,
+        messages: Sequence[Mapping[str, Any]] | Sequence[dict[str, Any]],
+        tools: Sequence[Mapping[str, Any]] | Sequence[dict[str, Any]] | None = None,
+        stream_factory: Callable[..., AsyncIterator[Any]] | None = None,
+        *,
+        reasoning_effort: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        track_concurrency: bool = False,
+        **stream_kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        """Open raw stream generator on ``account`` forwarding generation and header parameters."""
+        forward_kwargs: dict[str, Any] = dict(stream_kwargs)
+        optional_params = {
+            "reasoning_effort": reasoning_effort,
+            "headers": headers,
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+            "response_format": response_format,
+            "tool_choice": tool_choice,
+        }
+        for key, val in optional_params.items():
+            if val is not None and key not in forward_kwargs:
+                forward_kwargs[key] = val
+
+        if stream_factory is not None:
+            accepted_kwargs = _filter_supported_kwargs(stream_factory, forward_kwargs)
+            try:
+                sig = inspect.signature(stream_factory)
+                positional_params = [
+                    p
+                    for p in sig.parameters.values()
+                    if p.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                ]
+            except (ValueError, TypeError):
+                positional_params = []
+
+            stream: Any = None
+            if len(positional_params) >= 6:
+                eff_kwargs = {
+                    k: v
+                    for k, v in accepted_kwargs.items()
+                    if k not in ("model", "messages", "tools", "reasoning_effort")
+                }
+                stream = stream_factory(
+                    account,
+                    channel_type,
+                    model,
+                    messages,
+                    tools,
+                    reasoning_effort,
+                    **eff_kwargs,
+                )
+            else:
+                try:
+                    stream = stream_factory(account, channel_type, **accepted_kwargs)
+                except TypeError:
+                    try:
+                        stream = stream_factory(account, **accepted_kwargs)
+                    except TypeError:
+                        try:
+                            stream = stream_factory(account, channel_type)
+                        except TypeError:
+                            stream = stream_factory(account)
+        elif channel_type == "oauth":
+            oauth_kwargs = _filter_supported_kwargs(
+                self.oauth_channel.stream_chat, forward_kwargs
+            )
+            stream = self.oauth_channel.stream_chat(
+                messages=messages,
+                account=account if isinstance(account, OAuthAccount) else None,
+                model=model,
+                tools=tools,
+                **oauth_kwargs,
+            )
+        else:
+            web_candidates = dict(forward_kwargs)
+            web_candidates["track_concurrency"] = track_concurrency
+            web_kwargs = _filter_supported_kwargs(
+                self.web_channel.stream_chat, web_candidates
+            )
+            stream = self.web_channel.stream_chat(
+                account=account if isinstance(account, WebAccount) else account,
+                messages=messages,
+                model=model,
+                tools=tools,
+                **web_kwargs,
+            )
+
+        if inspect.iscoroutine(stream):
+            stream = await stream
+
+        return aiter(stream)
 
     async def _handle_handshake_failure(
         self,
@@ -276,7 +500,7 @@ class FailoverController:
         now: float | None = None,
     ) -> None:
         """Perform immediate concurrency decrement and classification upon handshake failure."""
-        now_ts = time.time() if now is None else float(now)
+        now_ts = self._time_fn() if now is None else float(now)
 
         # 1. Immediately decrement active_requests (zero concurrency leak)
         account.active_requests = max(0, account.active_requests - 1)
@@ -331,6 +555,13 @@ class FailoverController:
         tools: Sequence[Mapping[str, Any]] | Sequence[dict[str, Any]] | None = None,
         stream_factory: Callable[..., AsyncIterator[Any]] | None = None,
         *,
+        reasoning_effort: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         excluded_ids: set[str] | None = None,
         allow_cross_channel: bool = True,
         max_buffer_chunks: int | None = None,
@@ -339,24 +570,7 @@ class FailoverController:
         validate_model: bool = True,
         **stream_kwargs: Any,
     ) -> tuple[AsyncIterator[Any], OAuthAccount | WebAccount, Literal["oauth", "web"]]:
-        """Execute chat completion stream with pre-stream handshake and instant failover.
-
-        Steps per attempt:
-        a. Select optimal account via ``select_optimal_account`` (passing ``excluded_ids``).
-        b. Increment concurrency counter ``account.active_requests += 1``.
-        c. Apply ``apply_smart_pacing(account)`` if web account.
-        d. Open stream generator via channel streaming function or ``stream_factory``.
-        e. Consume initial chunks into ``buffered_chunks`` (up to ``HANDSHAKE_MAX_BUFFER_CHUNKS``).
-        f. Upon first non-empty chunk (``is_chunk_non_empty(chunk) == True``):
-           - Handshake succeeds!
-           - Returns ``(chain_async_iterators(buffered_chunks, stream), account, channel_type)``.
-        g. If generator ends without non-empty content (Zero-Byte EOF) or raises an error:
-           - Handshake fails before delivering response to client.
-           - Decrements active_requests immediately.
-           - Enforces cooldown / 429 classification.
-           - Adds account to ``excluded_ids`` and retries on next optimal account.
-        h. If pool is exhausted, raises ``PoolExhaustedError``.
-        """
+        """Execute chat completion stream with pre-stream handshake and instant failover."""
         # Validate model
         if not model or not isinstance(model, str) or not model.strip():
             raise ModelNotSupportedError("Model identifier must be a non-empty string.")
@@ -400,47 +614,34 @@ class FailoverController:
 
             # b. Increment concurrency counter
             account.active_requests += 1
+            attempt_started_at = self._time_fn() if now is None else float(now)
 
             # c. Apply smart pacing for Web account
             if channel_type == "web" and isinstance(account, WebAccount):
                 try:
-                    await apply_smart_pacing(account, now=now)
+                    await apply_smart_pacing(account, now=now, time_fn=self._time_fn)
                 except Exception as pace_err:
                     logger.warning("Pacing error on account %s: %s", account_id, pace_err)
 
             # d. Open stream generator
             try:
-                if stream_factory is not None:
-                    # Support stream_factory(account, channel_type, **kwargs),
-                    # stream_factory(account, **kwargs), or stream_factory(account)
-                    try:
-                        stream = stream_factory(account, channel_type, **stream_kwargs)
-                    except TypeError:
-                        try:
-                            stream = stream_factory(account, **stream_kwargs)
-                        except TypeError:
-                            stream = stream_factory(account)
-                elif channel_type == "oauth":
-                    stream = self.oauth_channel.stream_chat(
-                        messages=messages,
-                        account=account if isinstance(account, OAuthAccount) else None,
-                        model=model,
-                        tools=tools,
-                        **stream_kwargs,
-                    )
-                else:
-                    stream = self.web_channel.stream_chat(
-                        account=account if isinstance(account, WebAccount) else account,
-                        messages=messages,
-                        model=model,
-                        tools=tools,
-                        **stream_kwargs,
-                    )
-
-                if inspect.iscoroutine(stream):
-                    stream = await stream
-
-                stream_iter = aiter(stream)
+                stream_iter = await self._open_account_stream(
+                    account=account,
+                    channel_type=channel_type,
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    stream_factory=stream_factory,
+                    reasoning_effort=reasoning_effort,
+                    headers=headers,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    tool_choice=tool_choice,
+                    track_concurrency=False,
+                    **stream_kwargs,
+                )
             except Exception as setup_err:
                 logger.warning(
                     "Failed to open stream on account %s (%s): %s",
@@ -477,16 +678,27 @@ class FailoverController:
                 # Handshake succeeded!
                 completed = False
 
-                def _on_complete() -> None:
+                def _on_complete(completed_normally: bool = True) -> None:
                     nonlocal completed
                     if not completed:
                         completed = True
                         account.active_requests = max(0, account.active_requests - 1)
-                        now_ts = time.time() if now is None else float(now)
+                        end_ts = self._time_fn() if now is None else float(now)
                         if hasattr(account, "last_completed_timestamp"):
-                            account.last_completed_timestamp = now_ts
+                            account.last_completed_timestamp = end_ts
                         if hasattr(account, "last_request_end_time"):
-                            account.last_request_end_time = now_ts
+                            account.last_request_end_time = end_ts
+                        if completed_normally:
+                            latency_ms = max(0.0, (end_ts - attempt_started_at) * 1000.0)
+                            self._record_completion_success(
+                                account=account,
+                                model=model,
+                                messages=messages,
+                                tools=tools,
+                                latency_ms=latency_ms,
+                                end_ts=end_ts,
+                                bypass_web_channel=(stream_factory is not None),
+                            )
 
                 chained_stream = chain_async_iterators(
                     buffered_chunks=buffered_chunks,
@@ -524,11 +736,19 @@ class FailoverController:
         tools: Sequence[Mapping[str, Any]] | Sequence[dict[str, Any]] | None = None,
         stream_factory: Callable[..., AsyncIterator[Any]] | None = None,
         *,
+        reasoning_effort: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         excluded_ids: set[str] | None = None,
         allow_cross_channel: bool = True,
         max_retries: int | None = None,
         now: float | None = None,
         validate_model: bool = True,
+        include_internal_meta: bool = False,
         **stream_kwargs: Any,
     ) -> dict[str, Any]:
         """Execute standard non-streaming chat completion with end-to-end failover resilience."""
@@ -546,6 +766,13 @@ class FailoverController:
                 messages=messages,
                 tools=tools,
                 stream_factory=stream_factory,
+                reasoning_effort=reasoning_effort,
+                headers=headers,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                tool_choice=tool_choice,
                 excluded_ids=excluded,
                 allow_cross_channel=allow_cross_channel,
                 max_retries=max_retries,
@@ -555,13 +782,14 @@ class FailoverController:
             )
             attempts += 1
             account_id = getattr(account, "id", getattr(account, "account_id", str(account)))
+            pre_collect_active = account.active_requests
 
             content_parts: list[str] = []
             reasoning_parts: list[str] = []
             tool_calls_map: dict[int, dict[str, Any]] = {}
             finish_reason: str | None = None
             response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-            created_ts = int(time.time() if now is None else float(now))
+            created_ts = int(self._time_fn() if now is None else float(now))
 
             stream_broken = False
             try:
@@ -619,6 +847,14 @@ class FailoverController:
                     channel_type,
                     mid_stream_err,
                 )
+                # Ensure _handle_handshake_failure classifies 429/403 without double-decrementing active_requests
+                target_after_decrement = max(0, pre_collect_active - 1)
+                if account.active_requests == target_after_decrement:
+                    account.active_requests = pre_collect_active
+                await self._handle_handshake_failure(
+                    account, channel_type, mid_stream_err, now=now
+                )
+                account.active_requests = target_after_decrement
                 stream_broken = True
                 excluded.add(account_id)
 
@@ -647,7 +883,7 @@ class FailoverController:
             if assembled_tools is not None:
                 message_payload["tool_calls"] = assembled_tools
 
-            return {
+            base_payload: dict[str, Any] = {
                 "id": response_id,
                 "object": "chat.completion",
                 "created": created_ts,
@@ -664,9 +900,16 @@ class FailoverController:
                     "completion_tokens": len(full_content.split()) if full_content else 0,
                     "total_tokens": len(full_content.split()) if full_content else 0,
                 },
+            }
+            internal_meta = {
                 "_account_id": account_id,
                 "_channel": channel_type,
             }
+            if include_internal_meta:
+                base_payload.update(internal_meta)
+                return base_payload
+
+            return CompletionResponseDict(base_payload, internal_meta=internal_meta)
 
 
 # ============================================================================
@@ -743,6 +986,7 @@ async def execute_chat_completion_with_failover(
 
 
 __all__ = [
+    "CompletionResponseDict",
     "HANDSHAKE_MAX_BUFFER_CHUNKS",
     "FailoverController",
     "HandshakeFailedError",

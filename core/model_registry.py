@@ -372,10 +372,14 @@ def _iter_fetch_model_dicts(container: Any) -> list[tuple[str, dict[str, Any]]]:
     return entries
 
 
-def _apply_fetch_models_quotas(account: OAuthAccount, payload: Any) -> None:
+def _apply_fetch_models_quotas(
+    account: OAuthAccount,
+    payload: Any,
+) -> dict[str, ModelQuota]:
     """Update ``account.quota_state.model_quotas`` if quota fields exist in fetch payload."""
+    extracted_quotas: dict[str, ModelQuota] = {}
     if not isinstance(payload, dict):
-        return
+        return extracted_quotas
     container = payload.get("models") or payload.get("availableModels")
     for model_id, quota_details in _iter_fetch_model_dicts(container):
         quota_dict = (
@@ -387,9 +391,10 @@ def _apply_fetch_models_quotas(account: OAuthAccount, payload: Any) -> None:
             k in quota_dict
             for k in ("remainingFraction", "remaining_fraction", "resetTime", "reset_at")
         ):
-            account.quota_state.model_quotas[model_id] = _build_model_quota_from_bucket(
-                quota_dict
-            )
+            quota_obj = _build_model_quota_from_bucket(quota_dict)
+            account.quota_state.model_quotas[model_id] = quota_obj
+            extracted_quotas[model_id] = quota_obj
+    return extracted_quotas
 
 
 def _apply_quota_buckets(
@@ -470,21 +475,46 @@ def _is_permission_denied_response(response: httpx.Response) -> bool:
     return False
 
 
+async def fetch_available_models(
+    account: OAuthAccount,
+    token: str,
+    client: httpx.AsyncClient,
+) -> httpx.Response:
+    """Send POST request to ``v1internal:fetchAvailableModels``."""
+    headers = _build_oauth_headers(token)
+    request_body = {"project": account.credentials.project_id}
+    return await client.post(
+        FETCH_AVAILABLE_MODELS_URL,
+        json=request_body,
+        headers=headers,
+    )
+
+
+async def retrieve_user_quota(
+    account: OAuthAccount,
+    token: str,
+    client: httpx.AsyncClient,
+) -> list[str]:
+    """Send POST request to ``v1internal:retrieveUserQuota`` and populate ``account`` quotas."""
+    headers = _build_oauth_headers(token)
+    request_body = {"project": account.credentials.project_id}
+    quota_response = await client.post(
+        RETRIEVE_USER_QUOTA_URL,
+        json=request_body,
+        headers=headers,
+    )
+    quota_response.raise_for_status()
+    return _parse_and_apply_user_quota_payload(account, quota_response.json())
+
+
 async def _execute_oauth_discovery_requests(
     account: OAuthAccount,
     token: str,
     client: httpx.AsyncClient,
 ) -> list[str]:
-    """Perform ``:fetchAvailableModels`` with automatic 403 fallback to ``:retrieveUserQuota``."""
-    headers = _build_oauth_headers(token)
-    request_body = {"project": account.credentials.project_id}
-
+    """Perform ``:fetchAvailableModels`` with automatic 403 or missing-quota fallback to ``:retrieveUserQuota``."""
     try:
-        response = await client.post(
-            FETCH_AVAILABLE_MODELS_URL,
-            json=request_body,
-            headers=headers,
-        )
+        response = await fetch_available_models(account, token, client)
     except httpx.HTTPStatusError as exc:
         if exc.response is not None and _is_permission_denied_response(exc.response):
             response = exc.response
@@ -496,18 +526,25 @@ async def _execute_oauth_discovery_requests(
             "OAuth account %s received 403 on fetchAvailableModels; falling back to retrieveUserQuota",
             account.id,
         )
-        quota_response = await client.post(
-            RETRIEVE_USER_QUOTA_URL,
-            json=request_body,
-            headers=headers,
-        )
-        quota_response.raise_for_status()
-        return _parse_and_apply_user_quota_payload(account, quota_response.json())
+        return await retrieve_user_quota(account, token, client)
 
     response.raise_for_status()
     payload = response.json()
     models = _parse_models_from_fetch_payload(payload)
-    _apply_fetch_models_quotas(account, payload)
+    quotas = _apply_fetch_models_quotas(account, payload)
+    if not quotas:
+        try:
+            quota_models = await retrieve_user_quota(account, token, client)
+            for qm in quota_models:
+                if qm not in models:
+                    models.append(qm)
+        except Exception as exc:
+            logger.debug(
+                "retrieveUserQuota quota enrichment after fetchAvailableModels failed for account %s: %s",
+                account.id,
+                exc,
+            )
+
     if models:
         account.discovered_models = list(models)
     for model_id in account.discovered_models:
@@ -518,6 +555,14 @@ async def _execute_oauth_discovery_requests(
                 is_exhausted=False,
             )
     return models
+
+
+def _create_oauth_discovery_http_client(proxy: str | None = None) -> httpx.AsyncClient:
+    """Create an httpx.AsyncClient with HTTP/2 enabled and graceful fallback if h2 is unavailable."""
+    try:
+        return httpx.AsyncClient(http2=True, timeout=30.0, proxy=proxy)
+    except ImportError:
+        return httpx.AsyncClient(timeout=30.0, proxy=proxy)
 
 
 async def discover_oauth_models(
@@ -533,7 +578,7 @@ async def discover_oauth_models(
     if http_client is not None:
         return await _execute_oauth_discovery_requests(account, token, http_client)
 
-    async with httpx.AsyncClient(timeout=30.0, proxy=account.proxy) as owned_client:
+    async with _create_oauth_discovery_http_client(proxy=account.proxy) as owned_client:
         return await _execute_oauth_discovery_requests(account, token, owned_client)
 
 

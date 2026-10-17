@@ -97,6 +97,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "interval",
         minutes=5,
         args=[state_registry],
+        kwargs={"web_session_manager": web_session_manager},
         id="sync_quotas",
         replace_existing=True,
     )
@@ -132,6 +133,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await web_session_manager.flush_all_cookies()
         except Exception as exc:
             logger.warning("Error flushing cookies on shutdown: %s", exc)
+
+        try:
+            await web_session_manager.close_all()
+        except Exception as exc:
+            logger.warning("Error closing web session clients on shutdown: %s", exc)
+
+        try:
+            from config.settings import get_lmdb_store
+            get_lmdb_store().close()
+        except Exception as exc:
+            logger.warning("Error closing LMDB store on shutdown: %s", exc)
 
         try:
             await save_accounts_snapshot()
@@ -212,7 +224,7 @@ def _format_account_score(account: OAuthAccount | WebAccount, now: float) -> str
             score = calculate_web_account_score(account, "gemini-4-argon", now=now)
         return f"{score:.4f}"
     except Exception:
-        return f"{account.priority:.2f}"
+        return "0.0000"
 
 
 def ensure_accounts_loaded() -> None:
@@ -467,17 +479,57 @@ def add_web(account_id: str | None) -> None:
 
 
 @click.group(invoke_without_command=True)
+@click.option("--serve", "flag_serve", is_flag=True, help="Start the gateway server.")
+@click.option("--port", "flag_port", type=int, default=None, help="Port to bind when running server.")
+@click.option("--add-oauth", "flag_add_oauth", is_flag=True, help="Add an OAuth CLI account.")
+@click.option("--add-web", "flag_add_web", is_flag=True, help="Add a Web Cookie account.")
+@click.option("--label", "flag_label", type=str, default=None, help="Account label.")
+@click.option(
+    "--mode",
+    "flag_mode",
+    type=click.Choice(["http_v1internal", "agy_subprocess"]),
+    default="http_v1internal",
+    help="OAuth transport mode.",
+)
+@click.option("--firefox-profile", "flag_firefox_profile", type=str, default=None, help="Firefox profile name to import.")
 @click.option("--list-accounts", "flag_list_accounts", is_flag=True, help="List registered accounts.")
 @click.option("--sync-quotas", "flag_sync_quotas", is_flag=True, help="Sync account quotas immediately.")
 @click.option("--status", "flag_status", is_flag=True, help="Check pool health and status.")
 @click.pass_context
 def cli(
     ctx: click.Context,
+    flag_serve: bool,
+    flag_port: int | None,
+    flag_add_oauth: bool,
+    flag_add_web: bool,
+    flag_label: str | None,
+    flag_mode: str,
+    flag_firefox_profile: str | None,
     flag_list_accounts: bool,
     flag_sync_quotas: bool,
     flag_status: bool,
 ) -> None:
     """Gemini Hybrid Pool Gateway CLI & Management Interface."""
+    if flag_serve or (ctx.invoked_subcommand is None and not any([flag_list_accounts, flag_sync_quotas, flag_status, flag_add_oauth, flag_add_web])):
+        kwargs = {}
+        if flag_port is not None:
+            kwargs["port"] = flag_port
+        ctx.invoke(serve, **kwargs)
+        return
+    if flag_add_oauth:
+        kwargs = {"mode": flag_mode}
+        if flag_label is not None:
+            kwargs["label"] = flag_label
+        ctx.invoke(add_oauth, **kwargs)
+        return
+    if flag_add_web:
+        kwargs = {}
+        if flag_firefox_profile is not None:
+            kwargs["firefox_profile"] = flag_firefox_profile
+        if flag_label is not None:
+            kwargs["label"] = flag_label
+        ctx.invoke(add_web, **kwargs)
+        return
     if flag_list_accounts:
         ctx.invoke(list_accounts)
         return
@@ -487,8 +539,6 @@ def cli(
     if flag_status:
         ctx.invoke(status_cmd)
         return
-    if ctx.invoked_subcommand is None:
-        ctx.invoke(serve)
 
 
 cli.add_command(serve)

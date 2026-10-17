@@ -480,6 +480,34 @@ def test_record_successful_request_web_accumulates_deltas(
     assert sample_web_account.last_completed_timestamp == pytest.approx(5000.0)
 
 
+def test_record_successful_request_web_drift_safe_reset_precedes_accumulation(
+    sample_web_account: WebAccount,
+) -> None:
+    """Verify drift-safe reset runs BEFORE accumulating new deltas.
+
+    If current_time >= five_hour_reset_at, prior optimistic_5h_delta is cleared first,
+    and then the newly computed request delta is added (preserving the new consumption).
+    """
+    sample_web_account.usage.five_hour_reset_at = 1000
+    sample_web_account.optimistic_5h_delta = 0.40
+    sample_web_account.usage.weekly_reset_at = 5000
+    sample_web_account.optimistic_weekly_delta = 0.10
+
+    # Request executes at now=1005 (past 5h reset, but before weekly reset)
+    record_successful_request(
+        sample_web_account,
+        "gemini-4-argon",
+        latency_ms=1000.0,
+        context_chars=0,
+        now=1005.0,
+    )
+
+    # 5h delta was reset to 0.0 first, then argon base delta (0.10) was added -> 0.10
+    assert sample_web_account.optimistic_5h_delta == pytest.approx(0.10)
+    # Weekly delta was NOT reset (1005 < 5000), so 0.10 + (0.10 * 0.25) = 0.125
+    assert sample_web_account.optimistic_weekly_delta == pytest.approx(0.125)
+
+
 # ============================================================================
 # 8. Central Sync Pass Tests
 # ============================================================================

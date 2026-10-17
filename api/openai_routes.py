@@ -223,6 +223,22 @@ async def create_chat_completion(
     )
 
     effective_model = resolve_effective_model(body.model, body.reasoning_effort)
+    max_tokens = body.max_tokens if body.max_tokens is not None else body.max_completion_tokens
+    forward_kwargs: dict[str, Any] = {}
+    if body.reasoning_effort is not None:
+        forward_kwargs["reasoning_effort"] = body.reasoning_effort
+    if request.headers:
+        forward_kwargs["headers"] = dict(request.headers)
+    if body.temperature is not None:
+        forward_kwargs["temperature"] = body.temperature
+    if body.top_p is not None:
+        forward_kwargs["top_p"] = body.top_p
+    if max_tokens is not None:
+        forward_kwargs["max_tokens"] = max_tokens
+    if body.response_format is not None:
+        forward_kwargs["response_format"] = body.response_format
+    if body.tool_choice is not None:
+        forward_kwargs["tool_choice"] = body.tool_choice
 
     try:
         if body.stream:
@@ -230,6 +246,7 @@ async def create_chat_completion(
                 model=effective_model,
                 messages=sanitized_messages,
                 tools=body.tools,
+                **forward_kwargs,
             )
             sse_headers = {
                 "Cache-Control": "no-cache",
@@ -246,8 +263,14 @@ async def create_chat_completion(
             model=effective_model,
             messages=sanitized_messages,
             tools=body.tools,
+            **forward_kwargs,
         )
-        return JSONResponse(content=completion_result)
+        clean_result = (
+            {k: v for k, v in completion_result.items() if not k.startswith("_")}
+            if isinstance(completion_result, dict)
+            else completion_result
+        )
+        return JSONResponse(content=clean_result)
 
     except ModelNotSupportedError as exc:
         logger.warning("Requested model not supported: %s", exc)

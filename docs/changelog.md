@@ -4,6 +4,68 @@ All notable changes to the **Gemini-Hybrid-Pool-Gateway** (`v3.2` architecture) 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-17
+
+### Added
+
+- **Dynamic Model Routing & Compute Allocation Engine ([`core/hybrid_scheduler.py`](../core/hybrid_scheduler.py), [`config/settings.py`](../config/settings.py)):**
+  - Implemented dynamic runtime model route configuration model [`ModelRouteConfig`](../config/settings.py) supporting customizable `primary_channel` (`oauth` or `web`), optional `failover_channel` (`oauth`, `web`, or `none`), and custom aliases.
+  - Implemented persistent atomic JSON storage [`save_custom_model_routes`](../config/settings.py) and [`async_save_custom_model_routes`](../config/settings.py) managing `config/model_routes.json` with file locking and atomic rename, seamlessly falling back to default built-in routing rules.
+  - Updated [`get_model_channel_preference`](../core/hybrid_scheduler.py) to resolve model routes dynamically: checking explicit custom route overrides first, stripping reasoning effort suffixes (`-minimal`, `-low`, `-medium`, `-high`), resolving prefix patterns, and falling back to default channel strategies (`gemini-4-argon` -> Web only; Pro models -> Web first with OAuth failover; Flash models -> OAuth first with Web failover).
+  - Enhanced [`select_optimal_account`](../core/hybrid_scheduler.py) to dynamically honor configured primary and failover channels without hardcoded assumptions.
+- **REST Endpoints for Model Routing ([`api/dashboard_routes.py`](../api/dashboard_routes.py)):**
+  - Implemented dynamic route query endpoint `GET /api/model-routes` returning all active dynamic model routing configurations and default fallbacks.
+  - Implemented dynamic route creation and update endpoint `POST /api/model-routes` accepting runtime channel preferences (`primary`, `failover`) and persisting changes to disk.
+  - Implemented dynamic route deletion endpoint `DELETE /api/model-routes/{model}` reverting the specified model to default gateway scheduling behavior.
+- **Interactive Web Dashboard Section for Model Routing ([`static/index.html`](../static/index.html)):**
+  - Added dedicated Dynamic Model Routing management panel with live table of configured models, primary channels, failover policies, and actions.
+  - Added interactive modal dialogs for creating, modifying, and deleting model routes with real-time UI feedback.
+  - Added visual channel indicator badges (`OAuth CLI Pool` in cyan, `Web Cookie Pool` in emerald, `None (Strict)` in rose) and live quota statistics.
+- **Comprehensive Production Documentation ([`README.md`](../README.md)):**
+  - Overhauled and expanded `README.md` into a production-grade architectural guide covering system design, mathematical scheduling proofs, zero-drop failover resilience, 3-tier context rehydration, CLI management, REST API endpoints, and agent harness configurations (Pi, Hermes, Cursor).
+- **Test Suites for Audit Remediations and Routing ([`tests/test_audit_verified_fixes.py`](../tests/test_audit_verified_fixes.py), [`tests/test_model_routing_dynamic.py`](../tests/test_model_routing_dynamic.py)):**
+  - Added `tests/test_audit_verified_fixes.py` (7 tests) verifying critical defect fixes across Control, Auth, Protocol, and Interface planes.
+  - Added `tests/test_model_routing_dynamic.py` (15 tests) verifying dynamic model routing persistence, prefix resolution, custom aliases, failover bypass, and REST API endpoints.
+  - Total test suite coverage expanded to **368 passing tests** (up from 345 in v0.1.4).
+
+### Fixed
+
+- **Architectural Audit Remediations Across Operational Planes ($H\text{-}1.1$ through $H\text{-}4.5$):**
+  - **Control Plane ($H\text{-}1.1$ – $H\text{-}1.5$):**
+    - $H\text{-}1.1$: Fixed `FailoverController` instantiation of `WebChannel` to properly wire `WebSessionManager`, ensuring valid cookie session lifecycles.
+    - $H\text{-}1.2$: Added `track_concurrency=False` flag to `execute_web_channel_stream` to eliminate double-incrementing of `active_requests` counter when called by `FailoverController`.
+    - $H\text{-}1.3$: Added automatic latency EWMA updates, consecutive error clearing, and context-scaled optimistic delta accounting upon stream completion in `FailoverController`.
+    - $H\text{-}1.4$: Guaranteed zero concurrency counter leaks across client disconnects, timeouts, and cancellations in `execute_stream_with_failover`.
+    - $H\text{-}1.5$: Fixed anti-bot smart pacing race condition by reserving future execution time slots before awaiting sleep, properly staggering concurrent requests.
+  - **Auth & Quota Plane ($H\text{-}2.1$ – $H\text{-}2.5$):**
+    - $H\text{-}2.1$: Hardened per-account OAuth token refresh deduplication lock and atomic state serialization.
+    - $H\text{-}2.2$: Enhanced Google `batchexecute` / `jSf9Qc` response parser to handle leading byte-length framing lines (`128\n`) before JSON payload.
+    - $H\text{-}2.3$: Implemented drift-safe quota reset clearing optimistic deltas immediately upon expiration of 5-hour and weekly reset timestamps.
+    - $H\text{-}2.4$: Enforced isolated cookie cache persistence with atomic rename and strict path traversal protections in `config/cookies_cache/`.
+    - $H\text{-}2.5$: Prevented concurrent session destruction in `WebSessionManager.safe_reinit_or_close` by raising `ActiveRequestsConcurrencyError` when active streams exist.
+  - **Protocol & Data Plane ($H\text{-}3.1$ – $H\text{-}3.7$):**
+    - $H\text{-}3.1$: Fixed hash normalization discrepancy between persisted assistant XML `<tool_call>` and incoming OpenAI `tool_calls` dictionary for deterministic prefix matching.
+    - $H\text{-}3.2$: Hardened 3-Tier Context Rehydration to cleanly resolve and unlink temporary history files on completion or exception.
+    - $H\text{-}3.3$: Enhanced recursive JSON Schema sanitizer to resolve local `$ref` / `$defs` schemas and prune orphaned keys from `required`.
+    - $H\text{-}3.4$: Fixed ADR-05 zero-required tool schema handling, ensuring synthetic `_step` injection occurs only when properties are truly empty.
+    - $H\text{-}3.5$: Guaranteed cryptographic `thoughtSignature` preservation and restoration across multi-turn tool calling loops.
+    - $H\text{-}3.6$: Strictly filtered out `"requestType": "agent"` from `v1internal` envelopes to prevent false `429 RESOURCE_EXHAUSTED` rejections.
+    - $H\text{-}3.7$: Hardened base64 image detector in tool outputs to prevent false positive classification of text strings exceeding 32 characters.
+  - **Interface & Transport Plane ($H\text{-}4.1$ – $H\text{-}4.5$):**
+    - $H\text{-}4.1$: Replaced rigid model-to-channel bindings with dynamic runtime route registry and fallback engine.
+    - $H\text{-}4.2$: Added CLI compatibility flags (`--serve`, `--port`, `--status`, `--add-oauth`, `--add-web`, `--firefox-profile`).
+    - $H\text{-}4.3$: Fixed `AgySubprocessTransport` pipe deadlock by adding background `stderr` draining task for outputs exceeding 64KB.
+    - $H\text{-}4.4$: Ensured permissive Pydantic schema validation on chat completion endpoints to accept arbitrary agent harness parameters without 422 errors.
+    - $H\text{-}4.5$: Added real-time model routing management and health badge telemetry to the web dashboard UI.
+
+### Changed
+
+- **Runtime Model Routing & Compute Allocation:**
+  - Transitioned from hardcoded model routing to dynamic runtime preference engine with persistent fallback in `config/model_routes.json`.
+  - Enabled client and agent harnesses to configure primary and failover channels per model at runtime via REST API or Web Dashboard.
+
+---
+
 ## [0.1.4] - 2026-10-17
 
 ### Added

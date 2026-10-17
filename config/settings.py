@@ -18,7 +18,7 @@ import logging
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 import sys
 from importlib.machinery import ExtensionFileLoader
 from importlib.util import spec_from_file_location
@@ -52,8 +52,49 @@ logger = logging.getLogger(__name__)
 BASE_DIR: Path = Path(__file__).resolve().parent.parent
 CONFIG_DIR: Path = BASE_DIR / "config"
 
+
+def _strip_dotenv_value(raw_val: str) -> str:
+    """Strip matching surrounding quotes or inline comments from a ``.env`` value."""
+    val = raw_val.strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        return val[1:-1]
+    for idx, ch in enumerate(val):
+        if ch == "#" and (idx == 0 or val[idx - 1].isspace()):
+            return val[:idx].rstrip()
+    return val
+
+
+def _load_dotenv_if_present(dotenv_path: Path | str | None = None) -> None:
+    """Populate ``os.environ`` from ``.env`` via ``setdefault`` without overriding existing keys."""
+    target = Path(dotenv_path) if dotenv_path is not None else (BASE_DIR / ".env")
+    if not target.is_file():
+        return
+    try:
+        raw_content = target.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    for raw_line in raw_content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key_part, val_part = line.split("=", 1)
+        key = key_part.strip()
+        if key:
+            os.environ.setdefault(key, _strip_dotenv_value(val_part))
+
+
+_load_dotenv_if_present()
+
 ACCOUNTS_FILE_PATH: Path = Path(
     os.getenv("ACCOUNTS_FILE_PATH", str(CONFIG_DIR / "accounts.json"))
+)
+MODEL_ROUTES_FILE_PATH: Path = Path(
+    os.getenv("MODEL_ROUTES_FILE_PATH", str(CONFIG_DIR / "model_routes.json"))
 )
 COOKIES_CACHE_DIR: Path = Path(
     os.getenv("COOKIES_CACHE_DIR", str(CONFIG_DIR / "cookies_cache"))
@@ -84,6 +125,16 @@ DELTA_BASE: dict[str, float] = {
     "gemini-3.1-flash-lite": 0.000,
 }
 MODEL_BASE_WEIGHTS: dict[str, float] = DELTA_BASE
+BASE_MODEL_WEIGHTS_5H: dict[str, float] = DELTA_BASE
+WEB_PRO_SINGLE_REQUEST_CAP: float = 0.09
+
+# Default model routes: primary channel and optional failover channel
+DEFAULT_MODEL_ROUTES: dict[str, dict[str, Any]] = {
+    "gemini-4-argon": {"primary": "web", "failover": None},
+    "gemini-3.1-pro": {"primary": "web", "failover": "oauth"},
+    "gemini-3.8-flash": {"primary": "oauth", "failover": "web"},
+    "gemini-3.1-flash-lite": {"primary": "oauth", "failover": "web"},
+}
 
 # Smart Pacing & Hybrid Scheduler constants
 WEB_MIN_START_INTERVAL_S: float = 0.5
@@ -395,6 +446,34 @@ class AccountsConfig(BaseModel):
     web_accounts: list[WebAccount] = Field(default_factory=list)
 
 
+class ModelRouteConfig(BaseModel):
+    """Configuration for model channel routing and compute allocation."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    primary: Literal["oauth", "web"] = Field(alias="primary_channel")
+    failover: Literal["oauth", "web"] | None = Field(default=None, alias="failover_channel")
+
+    @property
+    def primary_channel(self) -> Literal["oauth", "web"]:
+        """Alias property matching primary_channel."""
+        return self.primary
+
+    @property
+    def failover_channel(self) -> Literal["oauth", "web"] | None:
+        """Alias property matching failover_channel."""
+        return self.failover
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize route configuration dictionary."""
+        return {
+            "primary": self.primary,
+            "failover": self.failover,
+            "primary_channel": self.primary,
+            "failover_channel": self.failover,
+        }
+
+
 # ============================================================================
 # 3. In-Memory Single Source of Truth & Atomic Snapshot Persistence
 # ============================================================================
@@ -556,6 +635,12 @@ async def _replace_file_with_windows_retry(tmp_path: Path, target_path: Path) ->
             await asyncio.sleep(0.005 * (attempt + 1))
 
 
+def _serialize_registry_snapshot(config: AccountsConfig | None = None) -> dict[str, Any]:
+    """Serialize ``AccountsConfig`` for disk persistence per ``01_DATA_SCHEMAS_AND_STATE.md``."""
+    target_config = config if config is not None else state_registry.config
+    return target_config.model_dump(mode="json", by_alias=True)
+
+
 async def save_accounts_snapshot(
     config: AccountsConfig | None = None,
     file_path: Path | str | None = None,
@@ -573,7 +658,7 @@ async def save_accounts_snapshot(
         target_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = target_path.with_name(f"{target_path.name}.tmp")
 
-        payload = state_registry.config.model_dump(mode="json", by_alias=True)
+        payload = _serialize_registry_snapshot(state_registry.config)
         serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
 
         with open(tmp_path, "w", encoding="utf-8") as tmp_file:
@@ -582,6 +667,112 @@ async def save_accounts_snapshot(
             os.fsync(tmp_file.fileno())
 
         await _replace_file_with_windows_retry(tmp_path, target_path)
+
+
+def get_custom_model_routes(
+    file_path: Path | str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return custom model routes from ``config/model_routes.json``.
+
+    If the file does not exist or is invalid, returns an empty dictionary.
+    """
+    target_path = Path(file_path) if file_path is not None else MODEL_ROUTES_FILE_PATH
+    if not target_path.is_file():
+        return {}
+    try:
+        raw_text = target_path.read_text(encoding="utf-8")
+        if not raw_text.strip():
+            return {}
+        data = json.loads(raw_text)
+        if not isinstance(data, dict):
+            return {}
+        normalized: dict[str, dict[str, Any]] = {}
+        for k, v in data.items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                continue
+            p = v.get("primary") or v.get("primary_channel")
+            f_val = v.get("failover")
+            if f_val is None and "failover_channel" in v:
+                f_val = v.get("failover_channel")
+            if f_val in ("none", "None", ""):
+                f_val = None
+            if p in ("oauth", "web"):
+                norm_f = f_val if f_val in ("oauth", "web") else None
+                normalized[k.strip().lower()] = {
+                    "primary": p,
+                    "failover": norm_f,
+                    "primary_channel": p,
+                    "failover_channel": norm_f,
+                }
+        return normalized
+    except Exception as exc:
+        logger.warning("Failed reading custom model routes from %s: %s", target_path, exc)
+        return {}
+
+
+def save_custom_model_routes(
+    routes: dict[str, dict[str, Any] | ModelRouteConfig],
+    file_path: Path | str | None = None,
+) -> None:
+    """Atomically persist custom model routes to ``config/model_routes.json``."""
+    import time
+
+    target_path = Path(file_path) if file_path is not None else MODEL_ROUTES_FILE_PATH
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_name(f"{target_path.name}.tmp")
+
+    payload: dict[str, dict[str, Any]] = {}
+    for k, v in routes.items():
+        if not isinstance(k, str):
+            continue
+        if isinstance(v, ModelRouteConfig):
+            p = v.primary
+            f_val = v.failover
+        elif isinstance(v, dict):
+            p = v.get("primary") or v.get("primary_channel")
+            f_val = v.get("failover")
+            if f_val is None and "failover_channel" in v:
+                f_val = v.get("failover_channel")
+            if f_val in ("none", "None", ""):
+                f_val = None
+        else:
+            continue
+
+        p_clean = "web" if str(p).lower() == "web" else "oauth"
+        f_clean = "web" if str(f_val).lower() == "web" else ("oauth" if str(f_val).lower() == "oauth" else None)
+        if f_clean == p_clean:
+            f_clean = None
+
+        payload[k.strip().lower()] = {
+            "primary": p_clean,
+            "failover": f_clean,
+            "primary_channel": p_clean,
+            "failover_channel": f_clean,
+        }
+
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    with open(tmp_path, "w", encoding="utf-8") as tmp_file:
+        tmp_file.write(serialized)
+        tmp_file.flush()
+        os.fsync(tmp_file.fileno())
+
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, target_path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.005 * (attempt + 1))
+
+
+async def async_save_custom_model_routes(
+    routes: dict[str, dict[str, Any] | ModelRouteConfig],
+    file_path: Path | str | None = None,
+) -> None:
+    """Async wrapper for save_custom_model_routes protected by accounts_file_lock."""
+    async with accounts_file_lock:
+        save_custom_model_routes(routes, file_path=file_path)
 
 
 # ============================================================================
@@ -632,32 +823,51 @@ class LMDBStore:
         session_id: str | None = None,
     ) -> None:
         """Store or update Web session record(s) under prefix hash(es) in ``db_sessions``."""
+        _ = session_id
         if metadata is not None:
             # Batch / test signature: put_session(session_id, account_id, hashes_list, metadata=...)
-            eff_session_id = arg1
             hashes = list(arg3) if isinstance(arg3, (list, tuple)) else [arg1]
             eff_metadata = metadata
         elif isinstance(arg3, (list, tuple)):
             # Standard signature: put_session(prefix_hash, account_id, metadata)
-            eff_session_id = session_id or ""
             hashes = [arg1]
             eff_metadata = list(arg3)
         else:
-            eff_session_id = session_id or ""
             hashes = [arg1]
             eff_metadata = []
 
         record = SessionRecord(
             account_id=account_id,
             metadata=list(eff_metadata),
-            session_id=eff_session_id,
         )
-        val_bytes = json.dumps(
-            record.model_dump(mode="json"), ensure_ascii=False
-        ).encode("utf-8")
+        clean_payload = {
+            "account_id": record.account_id,
+            "metadata": list(record.metadata),
+        }
+        val_bytes = json.dumps(clean_payload, ensure_ascii=False).encode("utf-8")
         with self.env.begin(db=self.db_sessions, write=True) as txn:
             for h in hashes:
                 txn.put(str(h).encode("utf-8"), val_bytes)
+
+    def put_session_record(
+        self,
+        prefix_hash: str,
+        record_or_account_id: SessionRecord | str,
+        metadata: Sequence[str] | None = None,
+    ) -> None:
+        """Store a ``SessionRecord`` under ``prefix_hash`` with clean LMDB value schema."""
+        if isinstance(record_or_account_id, SessionRecord):
+            self.put_session(
+                prefix_hash,
+                record_or_account_id.account_id,
+                record_or_account_id.metadata,
+            )
+        else:
+            self.put_session(
+                prefix_hash,
+                str(record_or_account_id),
+                list(metadata) if metadata is not None else [],
+            )
 
     def get_session(self, prefix_hash: str) -> dict[str, Any] | None:
         """Retrieve the session dict ``{"account_id": str, "metadata": list[str]}`` for ``prefix_hash``."""
@@ -669,13 +879,10 @@ class LMDBStore:
             try:
                 raw_record = json.loads(raw_bytes.decode("utf-8"))
                 record = SessionRecord.model_validate(raw_record)
-                result: dict[str, Any] = {
+                return {
                     "account_id": record.account_id,
                     "metadata": list(record.metadata),
                 }
-                if record.session_id:
-                    result["session_id"] = record.session_id
-                return result
             except (ValueError, KeyError) as exc:
                 logger.warning("Corrupted session entry for %s: %s", prefix_hash, exc)
                 return None
@@ -689,7 +896,10 @@ class LMDBStore:
                 return None
             try:
                 raw_record = json.loads(raw_bytes.decode("utf-8"))
-                return SessionRecord.model_validate(raw_record)
+                record = SessionRecord.model_validate(raw_record)
+                if not record.session_id:
+                    record.session_id = record.metadata[0] if record.metadata else prefix_hash
+                return record
             except (ValueError, KeyError) as exc:
                 logger.warning("Corrupted session entry for %s: %s", prefix_hash, exc)
                 return None
@@ -751,9 +961,19 @@ class LMDBStore:
 
     def close(self) -> None:
         """Sync and close the underlying LMDB environment."""
+        global _lmdb_store_instance
         if getattr(self, "env", None) is not None:
-            self.env.sync()
-            self.env.close()
+            try:
+                self.env.sync()
+            except Exception:
+                pass
+            try:
+                self.env.close()
+            except Exception:
+                pass
+            self.env = None
+        if _lmdb_store_instance is self:
+            _lmdb_store_instance = None
 
 
 _lmdb_store_instance: LMDBStore | None = None
@@ -777,7 +997,7 @@ def init_lmdb(
 def get_lmdb_store() -> LMDBStore:
     """Return the active singleton ``LMDBStore``, opening it lazily if needed."""
     global _lmdb_store_instance
-    if _lmdb_store_instance is None:
+    if _lmdb_store_instance is None or _lmdb_store_instance.env is None:
         _lmdb_store_instance = LMDBStore(path=LMDB_DIR, map_size=LMDB_MAP_SIZE)
     return _lmdb_store_instance
 
@@ -788,3 +1008,64 @@ def close_lmdb() -> None:
     if _lmdb_store_instance is not None:
         _lmdb_store_instance.close()
         _lmdb_store_instance = None
+
+
+__all__ = [
+    "ACCOUNTS_FILE_PATH",
+    "AccountsConfig",
+    "AccountsStateRegistry",
+    "BASE_DIR",
+    "BASE_MODEL_WEIGHTS_5H",
+    "CONFIG_DIR",
+    "COOKIES_CACHE_DIR",
+    "DEFAULT_MODEL_ROUTES",
+    "DELTA_BASE",
+    "LMDBStore",
+    "LMDB_DIR",
+    "LMDB_MAP_SIZE",
+    "LMDB_PATH",
+    "MODEL_BASE_WEIGHTS",
+    "MODEL_ROUTES_FILE_PATH",
+    "ModelQuota",
+    "ModelRouteConfig",
+    "OAUTH_MAX_CONCURRENCY_DEFAULT",
+    "OAUTH_MIN_REMAINING_FRACTION",
+    "OAuthAccount",
+    "OAuthCredentials",
+    "OAuthQuotaState",
+    "REHYDRATION_TIER2_MAX_CHARS",
+    "SESSION_AFFINITY_MAX_CONTEXT_CHARS",
+    "SESSION_AFFINITY_MULTIPLIER",
+    "SESSION_ROTATION_CHAR_LIMIT",
+    "SessionRecord",
+    "TEMP_HISTORY_DIR",
+    "WEB_5H_CEILING",
+    "WEB_FAST_REQUEST_THRESHOLD_S",
+    "WEB_JITTER_RANGE_S",
+    "WEB_MAX_5H_USAGE_PCT",
+    "WEB_MAX_CONCURRENCY_DEFAULT",
+    "WEB_MAX_WEEKLY_USAGE_PCT",
+    "WEB_MIN_INTERVAL_S",
+    "WEB_MIN_START_INTERVAL_S",
+    "WEB_PRO_SINGLE_REQUEST_CAP",
+    "WEB_URGENCY_WINDOW_S",
+    "WEB_WEEKLY_CEILING",
+    "WebAccount",
+    "WebCookies",
+    "WebUsage",
+    "accounts_file_lock",
+    "accounts_registry",
+    "async_save_custom_model_routes",
+    "close_lmdb",
+    "get_accounts_config",
+    "get_custom_model_routes",
+    "get_lmdb_store",
+    "get_model_base_delta",
+    "init_lmdb",
+    "load_accounts_into_memory",
+    "load_accounts_snapshot",
+    "save_accounts_snapshot",
+    "save_custom_model_routes",
+    "state_registry",
+]
+

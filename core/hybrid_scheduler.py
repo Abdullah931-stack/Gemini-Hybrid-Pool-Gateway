@@ -27,13 +27,14 @@ Implements Level 4 (Scheduling & Control Plane) of the Gemini-Hybrid-Pool-Gatewa
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import logging
 import random
 import time
 from typing import Any, Literal
 
 from config.settings import (
+    DELTA_BASE,
     LMDBStore,
     OAUTH_MIN_REMAINING_FRACTION,
     SESSION_AFFINITY_MULTIPLIER,
@@ -46,9 +47,12 @@ from config.settings import (
     WEB_URGENCY_WINDOW_S,
     WEB_WEEKLY_CEILING,
     AccountsStateRegistry,
+    ModelQuota,
     OAuthAccount,
     WebAccount,
+    get_custom_model_routes,
     get_lmdb_store,
+    get_model_base_delta,
     state_registry,
 )
 from core.model_registry import (
@@ -58,10 +62,19 @@ from core.model_registry import (
 from core.prefix_differ import (
     calculate_messages_char_length,
     compute_messages_char_length,
+    compute_prefix_hashes,
+    find_longest_prefix_session,
     get_preferred_session_account,
 )
 
 logger = logging.getLogger(__name__)
+
+# Constants & aliases for scheduling and delta calculation
+BASE_MODEL_WEIGHTS_5H: dict[str, float] = DELTA_BASE
+OAUTH_MIN_QUOTA_FRACTION: float = OAUTH_MIN_REMAINING_FRACTION
+SESSION_AFFINITY_MAX_CHARS: int = SESSION_ROTATION_CHAR_LIMIT
+WEB_PRO_SINGLE_REQUEST_CAP: float = 0.09
+estimate_messages_char_length = compute_messages_char_length
 
 
 # ============================================================================
@@ -73,20 +86,103 @@ class NoEligibleAccountError(RuntimeError):
     """Raised when no accounts in the pool are eligible to serve a request."""
 
 
+def _normalize_base_model(model: str) -> str:
+    """Strip reasoning effort suffix and normalize model name to lowercase."""
+    if not model:
+        return ""
+    base_model, _ = split_model_effort_suffix(model.strip())
+    return base_model.lower()
+
+
+def compute_context_scaled_delta_5h(
+    model_name: str,
+    context_chars: int = 0,
+) -> float:
+    """Calculate context-weighted optimistic 5-hour usage delta with Pro cap.
+
+    Formula (from 03_SCHEDULING_AND_CONTROL_SPEC.md):
+        Delta_5h(m, L_chars) = Delta_base(m) * (1.0 + 0.25 * (L_chars / 25000))
+    Applies WEB_PRO_SINGLE_REQUEST_CAP (0.09) when the base model is gemini-3.1-pro.
+    """
+    norm_base = _normalize_base_model(model_name)
+    base_delta = BASE_MODEL_WEIGHTS_5H.get(norm_base)
+    if base_delta is None:
+        base_delta = get_model_base_delta(norm_base)
+    if base_delta <= 0.0:
+        return 0.0
+
+    safe_chars = max(0, int(context_chars))
+    scaled_delta = float(base_delta * (1.0 + 0.25 * (safe_chars / 25000.0)))
+    if norm_base == "gemini-3.1-pro" or (
+        "pro" in norm_base and "argon" not in norm_base and "flash" not in norm_base
+    ):
+        scaled_delta = min(scaled_delta, WEB_PRO_SINGLE_REQUEST_CAP)
+    return float(scaled_delta)
+
+
+def _route_dict_to_channel_preference(
+    route: dict[str, Any],
+) -> tuple[Literal["oauth", "web"], Literal["oauth", "web"] | None]:
+    """Helper to convert a route configuration dictionary to channel preference tuple."""
+    p = route.get("primary") or route.get("primary_channel")
+    f_val = route.get("failover")
+    if f_val is None and "failover_channel" in route:
+        f_val = route.get("failover_channel")
+
+    primary: Literal["oauth", "web"] = "web" if str(p).lower() == "web" else "oauth"
+    failover: Literal["oauth", "web"] | None = None
+    if f_val is not None:
+        f_str = str(f_val).lower()
+        if f_str == "web":
+            failover = "web"
+        elif f_str == "oauth":
+            failover = "oauth"
+
+    if failover == primary:
+        failover = None
+    return (primary, failover)
+
+
 def get_model_channel_preference(
     model: str,
 ) -> tuple[Literal["oauth", "web"], Literal["oauth", "web"] | None]:
     """Determine primary and failover channel for a given model.
 
-    Routing rules:
+    Checks dynamic custom model routes first (from ``config/model_routes.json``),
+    matching exact model name / normalized base model, then longest prefix / alias.
+    If no custom route matches, falls back to default routing rules:
     - Argon (e.g. ``gemini-4-argon``): Web exclusively (never fall back to OAuth).
     - Pro (e.g. ``gemini-3.1-pro``, ``gemini-2.5-pro``): Web first, then OAuth.
     - Flash (e.g. ``gemini-3.8-flash``, ``gemini-3.1-flash-lite``): OAuth first, then Web.
     - Others: OAuth first, then Web.
     """
-    base_model, _ = split_model_effort_suffix(model)
-    norm = base_model.lower()
+    raw_lower = model.strip().lower() if model else ""
+    norm = _normalize_base_model(model)
 
+    try:
+        custom_routes = get_custom_model_routes()
+    except Exception:
+        custom_routes = {}
+
+    if custom_routes:
+        # 1. Exact match on raw lower name or normalized base model
+        if raw_lower in custom_routes:
+            return _route_dict_to_channel_preference(custom_routes[raw_lower])
+        if norm and norm in custom_routes:
+            return _route_dict_to_channel_preference(custom_routes[norm])
+
+        # 2. Prefix / alias match (longest key first)
+        for key in sorted(custom_routes.keys(), key=len, reverse=True):
+            if not key:
+                continue
+            if norm and (norm.startswith(key) or key.startswith(norm)):
+                return _route_dict_to_channel_preference(custom_routes[key])
+            if raw_lower and (raw_lower.startswith(key) or key.startswith(raw_lower)):
+                return _route_dict_to_channel_preference(custom_routes[key])
+            if key in norm or key in raw_lower:
+                return _route_dict_to_channel_preference(custom_routes[key])
+
+    # 3. Default routing rules
     if "argon" in norm:
         return ("web", None)
     if "pro" in norm:
@@ -100,13 +196,58 @@ def _account_supports_model(discovered_models: list[str], base_model: str) -> bo
     """Return True if ``discovered_models`` contains or matches ``base_model``."""
     if not discovered_models:
         return True
-    norm_target, _ = split_model_effort_suffix(base_model)
-    norm_target = norm_target.lower()
+    norm_target = _normalize_base_model(base_model)
     for candidate in discovered_models:
-        cand_base, _ = split_model_effort_suffix(candidate)
-        if cand_base.lower() == norm_target:
+        if _normalize_base_model(candidate) == norm_target:
             return True
+    try:
+        custom_routes = get_custom_model_routes()
+        raw_target = base_model.strip().lower()
+        if raw_target in custom_routes or norm_target in custom_routes:
+            return True
+        for key in custom_routes:
+            if key in raw_target or key in norm_target:
+                return True
+    except Exception:
+        pass
     return False
+
+
+def _lookup_oauth_model_quota(
+    account: OAuthAccount,
+    model: str,
+) -> ModelQuota | None:
+    """Resolve per-model quota on ``account`` after stripping effort suffixes."""
+    base_model, _ = split_model_effort_suffix(model.strip())
+    norm_base = base_model.lower()
+    model_quotas = account.quota_state.model_quotas
+    quota = model_quotas.get(norm_base) or model_quotas.get(base_model) or model_quotas.get(model)
+    if quota is not None:
+        return quota
+    for key, candidate_quota in model_quotas.items():
+        if _normalize_base_model(key) == norm_base:
+            return candidate_quota
+    return None
+
+
+def _get_effective_web_usage(
+    account: WebAccount,
+    now_ts: float,
+) -> tuple[float, float]:
+    """Return (effective_5h_usage, effective_weekly_usage) accounting for passed resets."""
+    five_hour_reset_at = account.usage.five_hour_reset_at
+    if five_hour_reset_at is not None and now_ts >= five_hour_reset_at:
+        eff_5h = 0.0
+    else:
+        eff_5h = float(account.usage.five_hour_pct) + float(account.optimistic_5h_delta)
+
+    weekly_reset_at = account.usage.weekly_reset_at
+    if weekly_reset_at is not None and now_ts >= weekly_reset_at:
+        eff_w = 0.0
+    else:
+        eff_w = float(account.usage.weekly_pct) + float(account.optimistic_weekly_delta)
+
+    return eff_5h, eff_w
 
 
 # ============================================================================
@@ -129,7 +270,7 @@ def is_oauth_account_eligible(
     - Requested model is Argon (OAuth CLI does not support gemini-4-argon).
     - Account's discovered_models is populated and does not include base_model.
     - Model quota is exhausted and reset_at is either unset or in the future.
-    - Model quota remaining_fraction <= OAUTH_MIN_REMAINING_FRACTION (0.02)
+    - Model quota remaining_fraction <= OAUTH_MIN_QUOTA_FRACTION (0.02)
       and reset_at is unset or in the future.
     """
     now_ts = time.time() if now is None else float(now)
@@ -144,26 +285,25 @@ def is_oauth_account_eligible(
     if account.active_requests >= account.max_concurrency:
         return False
 
-    base_model, _ = split_model_effort_suffix(model)
-    norm_base = base_model.lower()
+    norm_base = _normalize_base_model(model)
 
-    # Argon is strictly Web-only; Antigravity CLI does not offer it
+    # Argon is strictly Web-only by default; Antigravity CLI does not offer it
     if "argon" in norm_base:
-        return False
+        pref = get_model_channel_preference(model)
+        if pref[0] != "oauth" and pref[1] != "oauth":
+            return False
 
     if not _account_supports_model(account.discovered_models, norm_base):
         return False
 
     # Check model quota state
-    quota = account.quota_state.model_quotas.get(
-        norm_base
-    ) or account.quota_state.model_quotas.get(base_model)
+    quota = _lookup_oauth_model_quota(account, model)
     if quota is not None:
         reset_time_passed = quota.reset_at is not None and now_ts >= quota.reset_at
         if not reset_time_passed:
             if quota.is_exhausted:
                 return False
-            if quota.remaining_fraction < OAUTH_MIN_REMAINING_FRACTION:
+            if quota.remaining_fraction < OAUTH_MIN_QUOTA_FRACTION:
                 return False
 
     return True
@@ -182,8 +322,8 @@ def is_web_account_eligible(
     - Account is in active cooldown window (cooldown_until > now).
     - Active requests concurrency C >= max_concurrency.
     - Account's discovered_models is populated and does not include base_model.
-    - 5-hour usage (scraped + optimistic delta) >= WEB_5H_CEILING (0.95).
-    - Weekly usage (scraped + optimistic delta) >= WEB_WEEKLY_CEILING (0.98).
+    - 5-hour usage (scraped + optimistic delta) >= WEB_5H_CEILING (0.95) unless reset passed.
+    - Weekly usage (scraped + optimistic delta) >= WEB_WEEKLY_CEILING (0.98) unless reset passed.
     """
     now_ts = time.time() if now is None else float(now)
 
@@ -197,17 +337,15 @@ def is_web_account_eligible(
     if account.active_requests >= account.max_concurrency:
         return False
 
-    base_model, _ = split_model_effort_suffix(model)
-    norm_base = base_model.lower()
+    norm_base = _normalize_base_model(model)
 
     if not _account_supports_model(account.discovered_models, norm_base):
         return False
 
-    eff_5h = account.usage.five_hour_pct + account.optimistic_5h_delta
+    eff_5h, eff_w = _get_effective_web_usage(account, now_ts)
     if eff_5h >= WEB_5H_CEILING:
         return False
 
-    eff_w = account.usage.weekly_pct + account.optimistic_weekly_delta
     if eff_w >= WEB_WEEKLY_CEILING:
         return False
 
@@ -247,6 +385,9 @@ def calculate_session_affinity(
     messages: Sequence[dict[str, Any]] | None = None,
     tools: Sequence[dict[str, Any]] | None = None,
     lmdb_store: LMDBStore | None = None,
+    *,
+    preferred_account_id: str | None = None,
+    lmdb_env: Any = None,
 ) -> float:
     """Calculate session affinity multiplier S_i.
 
@@ -254,19 +395,80 @@ def calculate_session_affinity(
     db_sessions matching account.id and total message length < SESSION_ROTATION_CHAR_LIMIT
     (120,000 chars). Returns 1.0 otherwise.
     """
+    if preferred_account_id is not None:
+        if messages:
+            total_chars = estimate_messages_char_length(messages, tools=tools)
+            if total_chars >= SESSION_AFFINITY_MAX_CHARS:
+                return 1.0
+        return SESSION_AFFINITY_MULTIPLIER if preferred_account_id == account.id else 1.0
+
     if not messages:
         return 1.0
 
-    store = lmdb_store if lmdb_store is not None else get_lmdb_store()
-    preferred_id, total_chars = get_preferred_session_account(
-        messages, lmdb_store=store, tools=tools
-    )
-    if (
-        preferred_id is not None
-        and preferred_id == account.id
-        and total_chars < SESSION_ROTATION_CHAR_LIMIT
-    ):
+    total_chars = estimate_messages_char_length(messages, tools=tools)
+    if total_chars >= SESSION_AFFINITY_MAX_CHARS:
+        return 1.0
+
+    store = lmdb_store if lmdb_store is not None else (lmdb_env if lmdb_env is not None else get_lmdb_store())
+    try:
+        pref_res = get_preferred_session_account(
+            messages, lmdb_store=store, tools=tools
+        )
+    except TypeError:
+        pref_res = get_preferred_session_account(
+            messages, env=store, max_chars=SESSION_AFFINITY_MAX_CHARS
+        )
+
+    if isinstance(pref_res, tuple):
+        preferred_id, pref_chars = pref_res
+        if pref_chars >= SESSION_AFFINITY_MAX_CHARS:
+            return 1.0
+    else:
+        preferred_id = pref_res
+
+    if preferred_id is not None and preferred_id == account.id:
         return SESSION_AFFINITY_MULTIPLIER
+
+    # Account-scoped fallback: check if this specific account has a prefix match in LMDB
+    match: Any = None
+    try:
+        match = find_longest_prefix_session(
+            messages,
+            lmdb_store=store,
+            target_account_id=account.id,
+        )
+    except TypeError:
+        try:
+            match = find_longest_prefix_session(
+                messages,
+                env=store,
+                target_account_id=account.id,
+            )
+        except TypeError:
+            try:
+                match = find_longest_prefix_session(messages, lmdb_store=store)
+            except TypeError:
+                match = None
+
+    if match is not None:
+        match_acc_id = (
+            match.get("account_id")
+            if isinstance(match, dict)
+            else getattr(match, "account_id", None)
+        )
+        if match_acc_id == account.id:
+            return SESSION_AFFINITY_MULTIPLIER
+
+    # Direct LMDBStore scan fallback if find_longest_prefix_session did not filter by target_account_id
+    if hasattr(store, "get_session_record"):
+        try:
+            for p_hash in reversed(compute_prefix_hashes(messages)):
+                rec = store.get_session_record(p_hash)
+                if rec is not None and getattr(rec, "account_id", None) == account.id:
+                    return SESSION_AFFINITY_MULTIPLIER
+        except Exception:
+            pass
+
     return 1.0
 
 
@@ -305,7 +507,7 @@ def calculate_oauth_account_score(
     Where:
         G: eligibility gate (1.0 if eligible, else 0.0)
         tau: reset urgency for requested model
-        Q: remaining quota fraction in [0.0, 1.0]
+        Q: remaining quota fraction in [0.0, 1.0] (or 1.0 if reset_at has passed)
         C: active requests count
         L: recent latency EMA in milliseconds
     """
@@ -313,14 +515,16 @@ def calculate_oauth_account_score(
         return 0.0
 
     now_ts = time.time() if now is None else float(now)
-    base_model, _ = split_model_effort_suffix(model)
-    norm_base = base_model.lower()
-
-    quota = account.quota_state.model_quotas.get(
-        norm_base
-    ) or account.quota_state.model_quotas.get(base_model)
-    q = quota.remaining_fraction if quota is not None else 1.0
-    reset_at = quota.reset_at if quota is not None else None
+    quota = _lookup_oauth_model_quota(account, model)
+    if quota is not None:
+        if quota.reset_at is not None and now_ts >= quota.reset_at:
+            q = 1.0
+        else:
+            q = float(quota.remaining_fraction)
+        reset_at = quota.reset_at
+    else:
+        q = 1.0
+        reset_at = None
 
     tau = calculate_soonest_reset_urgency(reset_at, now=now_ts, window_s=window_s)
     c = float(account.active_requests)
@@ -349,8 +553,8 @@ def calculate_web_account_score(
         G: eligibility gate (1.0 if eligible, else 0.0)
         S: session affinity multiplier (1.35 if match, else 1.0)
         tau: 5-hour reset urgency in [1.0, 1.5]
-        U_5h: scraped 5h usage + optimistic delta
-        U_w: scraped weekly usage + optimistic delta
+        U_5h: scraped 5h usage + optimistic delta (or 0.0 if 5h reset passed)
+        U_w: scraped weekly usage + optimistic delta (or 0.0 if weekly reset passed)
         D_conc: conditional concurrency denominator
     """
     if not is_web_account_eligible(account, model, now=now):
@@ -364,8 +568,7 @@ def calculate_web_account_score(
         account.usage.five_hour_reset_at, now=now_ts, window_s=window_s
     )
 
-    u_5h = account.usage.five_hour_pct + account.optimistic_5h_delta
-    u_w = account.usage.weekly_pct + account.optimistic_weekly_delta
+    u_5h, u_w = _get_effective_web_usage(account, now_ts)
 
     margin_5h = max(0.0, WEB_5H_CEILING - u_5h)
     margin_w = max(0.0, WEB_WEEKLY_CEILING - u_w)
@@ -432,13 +635,24 @@ async def apply_smart_pacing(
     *,
     now: float | None = None,
     use_jitter: bool = False,
+    time_fn: Callable[[], float] = time.time,
+    sleep_fn: Callable[[float], Any] | None = None,
 ) -> float:
-    """Apply smart pacing delay via asyncio.sleep and record request start timestamp."""
-    delay = calculate_smart_pacing_delay(account, now=now, use_jitter=use_jitter)
-    if delay > 0.0:
-        await asyncio.sleep(delay)
+    """Apply smart pacing delay via sleep_fn and reserve request start timestamp pre-sleep."""
+    now_ts = float(time_fn()) if now is None else float(now)
+    delay = calculate_smart_pacing_delay(account, now=now_ts, use_jitter=use_jitter)
 
-    current_ts = time.time() if now is None else float(now)
+    # Reserve future slot BEFORE awaiting sleep so concurrent callers stagger properly (H-1.5)
+    reserved_ts = float(now_ts + delay)
+    account.last_started_timestamp = reserved_ts
+    if hasattr(account, "last_request_start_time"):
+        account.last_request_start_time = reserved_ts
+
+    if delay > 0.0:
+        actual_sleep = sleep_fn if sleep_fn is not None else asyncio.sleep
+        await actual_sleep(delay)
+
+    current_ts = float(time_fn()) if now is None else float(now)
     account.last_started_timestamp = current_ts
     if hasattr(account, "last_request_start_time"):
         account.last_request_start_time = current_ts

@@ -159,14 +159,11 @@ def test_build_v1internal_envelope_adr04_rejects_injected_request_type() -> None
         mock_spec.return_value.reasoning_effort = "low"
         mock_spec.return_value.oauth_thinking_config = {}
 
-        # Simulating tampering during build
+        # Verify that attempting to inject requestType triggers ADR-04 validation error
         with pytest.raises(ValueError, match="ADR-04"):
-            with patch.dict("os.environ", {}, clear=False):
-                # Verify building with invalid internal structure raises
-                envelope_bad = build_v1internal_envelope(contents=contents, model="gemini-3.8-flash")
-                envelope_bad["requestType"] = "agent"
-                if "requestType" in envelope_bad:
-                    raise ValueError("ADR-04 Violation: 'requestType' must NEVER be present")
+            build_v1internal_envelope(
+                contents=contents, model="gemini-3.8-flash", requestType="agent"
+            )
 
 
 # ============================================================================

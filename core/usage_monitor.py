@@ -29,7 +29,7 @@ Implements Level 3 (Usage Monitor Plane) of the Gemini-Hybrid-Pool-Gateway (v3.2
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import logging
@@ -41,6 +41,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from config.settings import (
+    DELTA_BASE,
     AccountsStateRegistry,
     ModelQuota,
     OAuthAccount,
@@ -51,7 +52,7 @@ from config.settings import (
     state_registry,
 )
 from core.auth_oauth_cli import ensure_valid_access_token
-from core.model_registry import discover_oauth_models
+from core.model_registry import discover_oauth_models, split_model_effort_suffix
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +64,14 @@ JSF9QC_RPC_ID: str = "jSf9Qc"
 GEMINI_BATCH_EXECUTE_URL: str = (
     "https://gemini.google.com/_/BardChatUi/data/batchexecute"
 )
+GEMINI_USAGE_PAGE_URL: str = "https://gemini.google.com/usage"
 USAGE_SOURCE_PATH: str = "/usage"
 
 XSSI_PREFIX: str = ")]}'\n"
+BASE_MODEL_WEIGHTS_5H: dict[str, float] = DELTA_BASE
+WEB_PRO_SINGLE_REQUEST_CAP: float = 0.09
+
+_SNLM0E_REGEX: re.Pattern[str] = re.compile(r'"SNlM0e"\s*:\s*"([^"]+)"')
 
 # Standard Tier IDs mapped to human-readable subscription labels
 TIER_LABELS: dict[int, str] = {
@@ -113,6 +119,7 @@ class WebUsageData:
     tier: str = "FREE"
     use_overage_credits: bool | None = None
     ai_credits_remaining: float | None = None
+    parsed_ok: bool = field(default=True, compare=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,26 +137,34 @@ class OAuth429Classification:
 # ============================================================================
 
 
-def calculate_optimistic_5h_delta(model_name: str, context_chars: int) -> float:
+def compute_context_scaled_delta_5h(model: str, context_chars: int = 0) -> float:
     r"""Calculate the estimated 5-hour quota consumption delta scaled by context length.
 
     Formula:
         \Delta_{5h}(m, L_{chars}) = \Delta_{base}(m) \times (1.0 + 0.25 \times (L_{chars} / 25000))
 
-    Parameters:
-        model_name: Canonical model name (e.g., 'gemini-4-argon', 'gemini-3.1-pro').
-        context_chars: Total character length of the conversation context.
-
-    Returns:
-        Optimistic quota consumption percentage as a float (e.g., 0.10 for 10%).
+    Strips any reasoning effort suffix (`-minimal`, `-low`, `-medium`, `-high`) before
+    looking up `BASE_MODEL_WEIGHTS_5H`, and caps `gemini-3.1-pro` single-request delta
+    at `WEB_PRO_SINGLE_REQUEST_CAP` (`0.09`).
     """
-    base_delta = get_model_base_delta(model_name)
+    base_model, _ = split_model_effort_suffix(model)
+    base_delta = BASE_MODEL_WEIGHTS_5H.get(
+        base_model, get_model_base_delta(base_model)
+    )
     safe_chars = max(0, int(context_chars))
     scaling_factor = 1.0 + 0.25 * (safe_chars / 25000.0)
-    return float(base_delta * scaling_factor)
+    delta = float(base_delta * scaling_factor)
+    if base_model == "gemini-3.1-pro" or "3.1-pro" in base_model:
+        delta = min(delta, WEB_PRO_SINGLE_REQUEST_CAP)
+    return delta
 
 
-def calculate_optimistic_weekly_delta(model_name: str, context_chars: int) -> float:
+def calculate_optimistic_5h_delta(model_name: str, context_chars: int = 0) -> float:
+    """Calculate the estimated 5-hour quota consumption delta scaled by context length."""
+    return compute_context_scaled_delta_5h(model_name, context_chars)
+
+
+def calculate_optimistic_weekly_delta(model_name: str, context_chars: int = 0) -> float:
     """Calculate the estimated weekly quota consumption delta.
 
     Weekly quota capacity in Gemini Web is significantly larger than the 5-hour
@@ -432,8 +447,10 @@ def parse_jsf9qc_usage_response(raw_text_or_json: Any) -> WebUsageData:
                 if not line:
                     continue
                 try:
-                    data = json.loads(line)
-                    break
+                    candidate = json.loads(line)
+                    if isinstance(candidate, (list, dict)):
+                        data = candidate
+                        break
                 except json.JSONDecodeError:
                     continue
             else:
@@ -845,15 +862,15 @@ def record_successful_request(
         account.last_error_reason = None
         account.last_completed_timestamp = current_time
 
+        # Check drift-safe reset threshold before accumulating new deltas
+        check_and_apply_drift_safe_resets(account, now=current_time)
+
         # Accumulate context-scaled optimistic quota consumption
         delta_5h = calculate_optimistic_5h_delta(model_name, context_chars)
         account.optimistic_5h_delta += delta_5h
 
         delta_w = calculate_optimistic_weekly_delta(model_name, context_chars)
         account.optimistic_weekly_delta += delta_w
-
-        # Check drift-safe reset threshold
-        check_and_apply_drift_safe_resets(account, now=current_time)
 
 
 async def sync_all_registered_accounts(

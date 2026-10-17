@@ -476,6 +476,96 @@
       right: 0.6rem;
     }
 
+    /* Dynamic Model Routing & Compute Allocation */
+    .routing-section {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 1.5rem;
+      margin-bottom: 2.5rem;
+      box-shadow: var(--shadow-card);
+    }
+    .routing-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1.25rem;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+    .routing-title {
+      font-size: 1.2rem;
+      font-weight: 700;
+      color: var(--accent-cyan);
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+    .routing-desc {
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      margin-bottom: 1.25rem;
+      line-height: 1.4;
+    }
+    .routing-add-bar {
+      display: flex;
+      gap: 0.75rem;
+      align-items: flex-end;
+      background: var(--bg-dark);
+      padding: 1rem;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border-color);
+      margin-bottom: 1.5rem;
+      flex-wrap: wrap;
+    }
+    .routing-add-field {
+      flex: 1;
+      min-width: 180px;
+    }
+    .routing-table-wrapper {
+      overflow-x: auto;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-color);
+    }
+    .routing-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      text-align: left;
+    }
+    .routing-table th {
+      background: var(--bg-card-subtle);
+      color: var(--text-muted);
+      font-weight: 600;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border-color);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .routing-table td {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid rgba(36, 52, 77, 0.5);
+      vertical-align: middle;
+    }
+    .routing-table tr:hover {
+      background: var(--bg-card-hover);
+    }
+    .channel-select {
+      background: var(--bg-dark);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 0.4rem 0.6rem;
+      border-radius: var(--radius-sm);
+      font-size: 0.82rem;
+      width: 100%;
+      max-width: 190px;
+    }
+    .channel-select:focus {
+      outline: none;
+      border-color: var(--accent-cyan);
+    }
+
     /* Modals */
     .modal-overlay {
       position: fixed;
@@ -704,6 +794,69 @@
       </div>
     </div>
 
+    <!-- Dynamic Model Routing & Compute Allocation Section -->
+    <div class="routing-section" id="sectionModelRouting">
+      <div class="routing-header">
+        <div class="routing-title">
+          <span>🧭 Dynamic Model Routing & Compute Allocation</span>
+          <span style="font-size: 0.88rem; color: var(--text-muted); font-weight: normal;">| توجيه النماذج وقنوات الحوسبة</span>
+        </div>
+        <button class="btn btn-outline btn-sm" onclick="fetchModelRoutes(true)">
+          <span>🔄 Refresh Routes</span>
+        </button>
+      </div>
+      <p class="routing-desc">
+        Configure primary compute channel and automatic failover per model or custom agent alias. Route preferences take effect immediately for all harness sub-agent requests and OpenAI completions, persisting to <code style="color: var(--accent-cyan);">config/model_routes.json</code>.
+      </p>
+
+      <!-- Add Custom Model / Alias Form -->
+      <div class="routing-add-bar">
+        <div class="routing-add-field">
+          <label class="form-label">Model Name / Custom Alias</label>
+          <input type="text" class="form-input" id="newRouteModel" placeholder="e.g. main_agent, sub_agent, gpt-4o, gemini-3.1-pro" />
+        </div>
+        <div class="routing-add-field">
+          <label class="form-label">Primary Channel</label>
+          <select class="form-select" id="newRoutePrimary">
+            <option value="oauth">OAuth CLI (CloudCode)</option>
+            <option value="web">Web Cookie (Google AI Pro)</option>
+          </select>
+        </div>
+        <div class="routing-add-field">
+          <label class="form-label">Failover Channel</label>
+          <select class="form-select" id="newRouteFailover">
+            <option value="web">Web Cookie (Google AI Pro)</option>
+            <option value="oauth">OAuth CLI (CloudCode)</option>
+            <option value="none">None (Exclusive Primary Only)</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" onclick="addNewModelRoute()" style="height: 38px;">
+          <span>+ Add / Override Route</span>
+        </button>
+      </div>
+
+      <!-- Routes Table -->
+      <div class="routing-table-wrapper">
+        <table class="routing-table">
+          <thead>
+            <tr>
+              <th>Model / Alias</th>
+              <th>Status</th>
+              <th>Primary Channel</th>
+              <th>Failover Channel</th>
+              <th>Supporting Accounts</th>
+              <th style="text-align: right;">Action</th>
+            </tr>
+          </thead>
+          <tbody id="modelRoutesTableBody">
+            <tr>
+              <td colspan="6" style="text-align: center; color: var(--text-dim); padding: 2rem;">Loading model routes...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- Section 1: OAuth CLI Accounts -->
     <div class="section-header">
       <div class="section-title">
@@ -845,6 +998,16 @@
     // State management
     let currentOAuthSession = null;
     let refreshIntervalId = null;
+
+    function escapeHtml(str) {
+      if (str === null || str === undefined) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
 
     // Toast notifications
     function showToast(message, type = "success") {
@@ -1072,7 +1235,7 @@
             return `
               <div class="progress-bar-wrapper">
                 <div class="progress-header">
-                  <span class="progress-title">${mName}</span>
+                  <span class="progress-title">${escapeHtml(mName)}</span>
                   <span class="progress-pct">${pct}% left</span>
                 </div>
                 <div class="progress-track">
@@ -1081,14 +1244,16 @@
               </div>`;
           }).join("");
 
+          const transportBadge = `<span class="badge" style="font-size: 0.65rem; background: rgba(56, 189, 248, 0.15); color: var(--accent-cyan);">${escapeHtml(acc.transport_mode || 'http_v1internal')}</span>`;
+
           return `
             <div class="account-card">
               <div class="account-card-header">
                 <div>
-                  <div class="account-id">${acc.id}</div>
-                  <div class="account-label">${acc.label || 'No label'}</div>
+                  <div class="account-id">${escapeHtml(acc.id)}</div>
+                  <div class="account-label">${escapeHtml(acc.label || 'No label')} &bull; ${transportBadge}</div>
                 </div>
-                <span class="badge ${statusClass}"><span class="badge-dot"></span> ${acc.status}</span>
+                <span class="badge ${statusClass}"><span class="badge-dot"></span> ${escapeHtml(acc.status)}</span>
               </div>
               <div class="account-metrics-row">
                 <div>
@@ -1097,11 +1262,11 @@
                 </div>
                 <div>
                   <div class="metric-item-label">Priority (P)</div>
-                  <div class="metric-item-value">${acc.priority_score.toFixed(3)}</div>
+                  <div class="metric-item-value">${Number(acc.priority_score || 0).toFixed(3)}</div>
                 </div>
                 <div>
                   <div class="metric-item-label">Latency (L)</div>
-                  <div class="metric-item-value">${acc.recent_latency_ms} ms</div>
+                  <div class="metric-item-value">${Math.round(acc.recent_latency_ms || 0)} ms</div>
                 </div>
               </div>
               <div class="quota-group">
@@ -1109,7 +1274,7 @@
                 ${quotasHtml || '<div style="font-size: 0.75rem; color: var(--text-dim);">No quotas recorded</div>'}
               </div>
               <div style="display: flex; justify-content: flex-end; margin-top: auto; padding-top: 0.5rem; border-top: 1px solid var(--border-color);">
-                <button class="btn btn-danger btn-sm" onclick="deleteAccount('oauth', '${acc.id}')">Delete</button>
+                <button class="btn btn-danger btn-sm" onclick="deleteAccount('oauth', '${encodeURIComponent(acc.id)}')">Delete</button>
               </div>
             </div>`;
         }).join("");
@@ -1126,19 +1291,22 @@
       } else {
         webContainer.innerHTML = data.web_accounts.map(acc => {
           const statusClass = acc.status === "ACTIVE" ? "badge-active" : (acc.status === "COOLDOWN" ? "badge-cooldown" : "badge-suspended");
-          const u5 = Math.round(acc.usage.effective_5h_pct * 100);
-          const uw = Math.round(acc.usage.effective_weekly_pct * 100);
+          const u5 = Math.round((acc.usage ? acc.usage.effective_5h_pct : 0) * 100);
+          const uw = Math.round((acc.usage ? acc.usage.effective_weekly_pct : 0) * 100);
           const fillClass5 = u5 < 60 ? "fill-green" : (u5 < 85 ? "fill-amber" : "fill-rose");
           const fillClassW = uw < 60 ? "fill-green" : (uw < 85 ? "fill-amber" : "fill-rose");
+
+          const affinity = (acc.dynamic_metrics && acc.dynamic_metrics.affinity) ? acc.dynamic_metrics.affinity.toFixed(2) : '1.00';
+          const dConc = (acc.dynamic_metrics && acc.dynamic_metrics.d_conc) ? acc.dynamic_metrics.d_conc.toFixed(2) : '1.00';
 
           return `
             <div class="account-card">
               <div class="account-card-header">
                 <div>
-                  <div class="account-id">${acc.id}</div>
-                  <div class="account-label">${acc.label || 'No label'} &bull; <span class="badge badge-tier">${acc.tier}</span></div>
+                  <div class="account-id">${escapeHtml(acc.id)}</div>
+                  <div class="account-label">${escapeHtml(acc.label || 'No label')} &bull; <span class="badge badge-tier">${escapeHtml(acc.tier || 'FREE')}</span></div>
                 </div>
-                <span class="badge ${statusClass}"><span class="badge-dot"></span> ${acc.status}</span>
+                <span class="badge ${statusClass}"><span class="badge-dot"></span> ${escapeHtml(acc.status)}</span>
               </div>
               <div class="account-metrics-row">
                 <div>
@@ -1147,11 +1315,15 @@
                 </div>
                 <div>
                   <div class="metric-item-label">Priority (P)</div>
-                  <div class="metric-item-value">${acc.priority_score.toFixed(3)}</div>
+                  <div class="metric-item-value">${Number(acc.priority_score || 0).toFixed(3)}</div>
                 </div>
                 <div>
                   <div class="metric-item-label">Urgency (&tau;)</div>
-                  <div class="metric-item-value">${acc.dynamic_metrics.tau}</div>
+                  <div class="metric-item-value">${(acc.dynamic_metrics && acc.dynamic_metrics.tau) ? acc.dynamic_metrics.tau : '1.0'}</div>
+                </div>
+                <div>
+                  <div class="metric-item-label">Affinity / D_conc</div>
+                  <div class="metric-item-value">${affinity} / ${dConc}</div>
                 </div>
               </div>
               <div class="quota-group">
@@ -1175,10 +1347,178 @@
                 </div>
               </div>
               <div style="display: flex; justify-content: flex-end; margin-top: auto; padding-top: 0.5rem; border-top: 1px solid var(--border-color);">
-                <button class="btn btn-danger btn-sm" onclick="deleteAccount('web', '${acc.id}')">Delete</button>
+                <button class="btn btn-danger btn-sm" onclick="deleteAccount('web', '${encodeURIComponent(acc.id)}')">Delete</button>
               </div>
             </div>`;
         }).join("");
+      }
+    }
+
+    // Model Routes State & API Calls
+    let currentModelRoutes = [];
+
+    async function fetchModelRoutes(showToastFeedback = false) {
+      try {
+        const resp = await fetch("/api/model-routes");
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        currentModelRoutes = data.routes || [];
+        renderModelRoutes(data);
+        if (showToastFeedback) {
+          showToast("Model routes refreshed!");
+        }
+      } catch (err) {
+        console.warn("Failed to fetch model routes:", err);
+      }
+    }
+
+    function renderModelRoutes(data) {
+      const tbody = document.getElementById("modelRoutesTableBody");
+      if (!tbody) return;
+      const routes = data.routes || [];
+      if (routes.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-dim); padding: 2rem;">No models or routes found.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = routes.map((r, idx) => {
+        const modelId = escapeHtml(r.model);
+        const isCustom = r.is_custom;
+        const typeBadge = isCustom
+          ? `<span class="badge" style="background: rgba(168, 85, 247, 0.15); color: var(--accent-purple); border: 1px solid rgba(168, 85, 247, 0.3);">Custom Override</span>`
+          : `<span class="badge" style="background: rgba(56, 189, 248, 0.12); color: var(--accent-cyan); border: 1px solid rgba(56, 189, 248, 0.25);">Discovered</span>`;
+
+        const primaryOAuthSelected = r.primary_channel === 'oauth' ? 'selected' : '';
+        const primaryWebSelected = r.primary_channel === 'web' ? 'selected' : '';
+
+        const failoverNoneSelected = !r.failover_channel ? 'selected' : '';
+        const failoverOAuthSelected = r.failover_channel === 'oauth' ? 'selected' : '';
+        const failoverWebSelected = r.failover_channel === 'web' ? 'selected' : '';
+
+        const oauthAccountsCount = (r.supporting_accounts && r.supporting_accounts.oauth) || 0;
+        const webAccountsCount = (r.supporting_accounts && r.supporting_accounts.web) || 0;
+
+        const accountsPill = `<span style="font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-muted);">OAuth: <strong style="color: var(--accent-cyan);">${oauthAccountsCount}</strong> | Web: <strong style="color: var(--accent-green);">${webAccountsCount}</strong></span>`;
+
+        const resetBtn = isCustom
+          ? `<button class="btn btn-outline btn-sm" style="color: var(--accent-rose); border-color: rgba(244, 63, 94, 0.3); margin-left: 0.4rem;" onclick="deleteModelRoute('${encodeURIComponent(r.model)}')">Reset</button>`
+          : '';
+
+        return `
+          <tr>
+            <td>
+              <div style="font-family: var(--font-mono); font-weight: 600; color: var(--text-main); font-size: 0.9rem;">
+                ${modelId}
+              </div>
+            </td>
+            <td>${typeBadge}</td>
+            <td>
+              <select class="channel-select" id="selectPrimary_${idx}">
+                <option value="oauth" ${primaryOAuthSelected}>OAuth CLI</option>
+                <option value="web" ${primaryWebSelected}>Web Cookie</option>
+              </select>
+            </td>
+            <td>
+              <select class="channel-select" id="selectFailover_${idx}">
+                <option value="none" ${failoverNoneSelected}>None (Exclusive)</option>
+                <option value="oauth" ${failoverOAuthSelected}>OAuth CLI</option>
+                <option value="web" ${failoverWebSelected}>Web Cookie</option>
+              </select>
+            </td>
+            <td>${accountsPill}</td>
+            <td style="text-align: right; white-space: nowrap;">
+              <button class="btn btn-primary btn-sm" onclick="saveModelRoute('${escapeHtml(r.model)}', ${idx})">Save</button>
+              ${resetBtn}
+            </td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    async function saveModelRoute(modelName, idx) {
+      const primary = document.getElementById(`selectPrimary_${idx}`).value;
+      const failoverVal = document.getElementById(`selectFailover_${idx}`).value;
+      const failover = failoverVal === "none" ? null : failoverVal;
+
+      if (failover === primary) {
+        showToast("Failover channel cannot be identical to Primary channel.", "error");
+        return;
+      }
+
+      try {
+        const resp = await fetch("/api/model-routes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: modelName,
+            primary_channel: primary,
+            failover_channel: failover,
+          }),
+        });
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({ detail: "Update failed" }));
+          throw new Error(errData.detail || "Update failed");
+        }
+        showToast(`Routing for '${modelName}' updated!`);
+        await fetchModelRoutes();
+      } catch (err) {
+        showToast(`Save failed: ${err.message}`, "error");
+      }
+    }
+
+    async function addNewModelRoute() {
+      const modelInput = document.getElementById("newRouteModel");
+      const modelName = modelInput.value.trim();
+      if (!modelName) {
+        showToast("Please enter a model name or alias.", "error");
+        return;
+      }
+      const primary = document.getElementById("newRoutePrimary").value;
+      const failoverVal = document.getElementById("newRouteFailover").value;
+      const failover = failoverVal === "none" ? null : failoverVal;
+
+      if (failover === primary) {
+        showToast("Failover channel cannot be identical to Primary channel.", "error");
+        return;
+      }
+
+      try {
+        const resp = await fetch("/api/model-routes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: modelName,
+            primary_channel: primary,
+            failover_channel: failover,
+          }),
+        });
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({ detail: "Creation failed" }));
+          throw new Error(errData.detail || "Creation failed");
+        }
+        showToast(`Custom route for '${modelName}' added successfully!`);
+        modelInput.value = "";
+        await fetchModelRoutes();
+      } catch (err) {
+        showToast(`Add failed: ${err.message}`, "error");
+      }
+    }
+
+    async function deleteModelRoute(encodedModel) {
+      const modelName = decodeURIComponent(encodedModel);
+      if (!confirm(`Reset route for '${modelName}' back to system default?`)) return;
+      try {
+        const resp = await fetch(`/api/model-routes/${encodeURIComponent(modelName)}`, {
+          method: "DELETE",
+        });
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({ detail: "Reset failed" }));
+          throw new Error(errData.detail || "Reset failed");
+        }
+        showToast(`Route for '${modelName}' reset to default.`);
+        await fetchModelRoutes();
+      } catch (err) {
+        showToast(`Reset failed: ${err.message}`, "error");
       }
     }
 
@@ -1188,7 +1528,10 @@
       function updateInterval() {
         if (toggle.checked) {
           if (!refreshIntervalId) {
-            refreshIntervalId = setInterval(fetchGatewayStatus, 3000);
+            refreshIntervalId = setInterval(async () => {
+              await fetchGatewayStatus();
+              await fetchModelRoutes();
+            }, 3000);
           }
         } else {
           if (refreshIntervalId) {
@@ -1204,6 +1547,7 @@
     // Init
     document.addEventListener("DOMContentLoaded", () => {
       fetchGatewayStatus();
+      fetchModelRoutes();
       initAutoRefresh();
     });
   </script>

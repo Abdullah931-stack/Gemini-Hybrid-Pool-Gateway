@@ -192,33 +192,36 @@ def _query_moz_cookies_file(db_path: Path, domain_suffix: str) -> dict[str, str]
     except (sqlite3.OperationalError, sqlite3.DatabaseError):
         conn = sqlite3.connect(str(db_path.resolve()), timeout=5.0)
 
-    with conn:
-        try:
-            cursor = conn.execute(
-                "SELECT name, value FROM moz_cookies "
-                "WHERE name IN (?, ?) AND (host LIKE ? OR host = ?) "
-                "ORDER BY lastAccessed DESC",
-                (
-                    SECURE_1PSID_COOKIE_NAME,
-                    SECURE_1PSIDTS_COOKIE_NAME,
-                    f"%{normalized_domain}",
-                    normalized_domain,
-                ),
-            )
-        except sqlite3.OperationalError:
-            cursor = conn.execute(
-                "SELECT name, value FROM moz_cookies "
-                "WHERE name IN (?, ?) AND (host LIKE ? OR host = ?)",
-                (
-                    SECURE_1PSID_COOKIE_NAME,
-                    SECURE_1PSIDTS_COOKIE_NAME,
-                    f"%{normalized_domain}",
-                    normalized_domain,
-                ),
-            )
-        for cookie_name, cookie_value in cursor.fetchall():
-            if cookie_name and cookie_value and cookie_name not in found_cookies:
-                found_cookies[str(cookie_name)] = str(cookie_value).strip()
+    try:
+        with conn:
+            try:
+                cursor = conn.execute(
+                    "SELECT name, value FROM moz_cookies "
+                    "WHERE name IN (?, ?) AND (host LIKE ? OR host = ?) "
+                    "ORDER BY lastAccessed DESC",
+                    (
+                        SECURE_1PSID_COOKIE_NAME,
+                        SECURE_1PSIDTS_COOKIE_NAME,
+                        f"%{normalized_domain}",
+                        normalized_domain,
+                    ),
+                )
+            except sqlite3.OperationalError:
+                cursor = conn.execute(
+                    "SELECT name, value FROM moz_cookies "
+                    "WHERE name IN (?, ?) AND (host LIKE ? OR host = ?)",
+                    (
+                        SECURE_1PSID_COOKIE_NAME,
+                        SECURE_1PSIDTS_COOKIE_NAME,
+                        f"%{normalized_domain}",
+                        normalized_domain,
+                    ),
+                )
+            for cookie_name, cookie_value in cursor.fetchall():
+                if cookie_name and cookie_value and cookie_name not in found_cookies:
+                    found_cookies[str(cookie_name)] = str(cookie_value).strip()
+    finally:
+        conn.close()
     return found_cookies
 
 
@@ -540,25 +543,38 @@ def extract_client_web_cookies(
     return WebCookies(secure_1psid=psid, secure_1psidts=psidts)
 
 
-async def _write_isolated_cookie_json(
+def _write_isolated_cookie_json(
     target_path: Path,
-    account_id: str,
-    cookies: WebCookies,
-) -> None:
-    """Atomically write the isolated cookie JSON payload via a ``.tmp`` file and ``os.replace``."""
+    payload_or_account_id: Mapping[str, Any] | str,
+    cookies: WebCookies | None = None,
+) -> Path:
+    """Atomically write the isolated cookie JSON payload via a ``.tmp`` file and ``os.replace`` with Windows retry."""
     target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target_path.with_name(f"{target_path.name}.tmp")
-    payload = {
-        "account_id": account_id,
-        "updated_at": int(time.time()),
-        "cookies": cookies.to_dict(),
-    }
+    if isinstance(payload_or_account_id, Mapping):
+        payload = dict(payload_or_account_id)
+    else:
+        payload = {
+            "account_id": str(payload_or_account_id),
+            "updated_at": int(time.time()),
+            "cookies": cookies.to_dict() if cookies is not None else {},
+        }
     serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     with open(tmp_path, "w", encoding="utf-8") as tmp_file:
         tmp_file.write(serialized)
         tmp_file.flush()
         os.fsync(tmp_file.fileno())
-    await _replace_file_with_windows_retry(tmp_path, target_path)
+
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            os.replace(tmp_path, target_path)
+            break
+        except PermissionError:
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+    return target_path
 
 
 class AwaitablePath(type(Path())):
@@ -566,13 +582,15 @@ class AwaitablePath(type(Path())):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__()
-        self._async_side_effects: list[Any] = []
+        self._async_side_effects: list[Callable[[], Any] | Any] = []
 
     def __await__(self) -> Any:
         async def _resolve() -> Path:
-            for coro in self._async_side_effects:
+            for effect in list(self._async_side_effects):
+                coro = effect() if callable(effect) else effect
                 if inspect.isawaitable(coro):
                     await coro
+            self._async_side_effects.clear()
             return self
 
         return _resolve().__await__()
@@ -602,31 +620,26 @@ def save_account_cookies_isolated(
         if latest_cookies.secure_1psid:
             account.cookies = latest_cookies
 
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_path.with_name(f"{target_path.name}.tmp")
     payload = {
         "account_id": account.id,
         "updated_at": int(time.time()),
         "cookies": account.cookies.to_dict(),
     }
-    serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-    with open(tmp_path, "w", encoding="utf-8") as tmp_file:
-        tmp_file.write(serialized)
-        tmp_file.flush()
-        os.fsync(tmp_file.fileno())
-    os.replace(tmp_path, target_path)
+    _write_isolated_cookie_json(target_path, payload)
     account.cookie_file = str(target_path)
 
-    awaitable_path = AwaitablePath(str(target_path))
     if sync_snapshot:
         state_registry.upsert_web_account(account)
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None and loop.is_running():
-            awaitable_path._async_side_effects.append(save_accounts_snapshot())
 
+    awaitable_path = AwaitablePath(str(target_path))
+
+    async def _async_persist() -> None:
+        async with account.cookie_write_lock:
+            _write_isolated_cookie_json(target_path, payload)
+        if sync_snapshot:
+            await save_accounts_snapshot()
+
+    awaitable_path._async_side_effects.append(_async_persist)
     return awaitable_path
 
 
@@ -893,3 +906,4 @@ class WebSessionManager:
 
 
 web_session_manager = WebSessionManager()
+default_web_session_manager = web_session_manager

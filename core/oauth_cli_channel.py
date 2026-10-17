@@ -31,10 +31,13 @@ Implements Level 3 (OAuth CLI Channel & Protocol Gateway) of the Gemini-Hybrid-P
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+import base64
+import binascii
+from collections.abc import AsyncIterator, Mapping, Sequence
 import copy
 import json
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -50,8 +53,13 @@ from core.auth_oauth_cli import (
     validate_production_endpoint,
 )
 from core.model_registry import inject_oauth_thinking_config, parse_model_and_effort
+import core.schema_sanitizer as _schema_sanitizer
 from core.schema_sanitizer import (
+    apply_zero_required_fix,
+    clean_json_schema,
+    flatten_unions,
     reinject_step_to_args,
+    sanitize_parameters_schema,
     sanitize_system_prompt_text,
     sanitize_tools,
     strip_step_from_args,
@@ -73,8 +81,15 @@ CONTINUE_PROMPT_TEXT: str = "Continue."
 DEFAULT_TIMEOUT_SECONDS: float = 60.0
 
 _BASE64_DATA_URL_RE: re.Pattern[str] = re.compile(
-    r"^data:(?P<mime>[a-zA-Z0-9]+/[a-zA-Z0-9\-\+\.]+);base64,(?P<data>[A-Za-z0-9+/=]+)$",
-    flags=re.DOTALL,
+    r"^data:(?P<mime>image/[a-zA-Z0-9\-\+\.]+);base64,(?P<data>[A-Za-z0-9+/=\s]+)$",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+_RAW_BASE64_IMAGE_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("iVBORw0KGgo", "image/png"),
+    ("/9j/", "image/jpeg"),
+    ("R0lGOD", "image/gif"),
+    ("UklGR", "image/webp"),
 )
 
 _FINISH_REASON_MAP: dict[str, str] = {
@@ -95,15 +110,28 @@ _FINISH_REASON_MAP: dict[str, str] = {
 
 
 def _extract_base64_image_data(image_input: str) -> tuple[str, str] | None:
-    """Parse a data URI or raw base64 string, returning (mime_type, base64_data)."""
+    """Parse a data:image URI or validated raw base64 image string, returning (mime_type, base64_data)."""
+    if not isinstance(image_input, str):
+        return None
     cleaned = image_input.strip()
+    if not cleaned:
+        return None
+
     match = _BASE64_DATA_URL_RE.match(cleaned)
     if match:
-        return match.group("mime"), match.group("data")
+        compact_data = re.sub(r"\s+", "", match.group("data"))
+        return match.group("mime").lower(), compact_data
 
-    # If it's a raw base64 string with no URI prefix, default to image/png
-    if len(cleaned) > 32 and not cleaned.startswith(("http://", "https://", "file://")):
-        return "image/png", cleaned
+    # Raw string (without data:image/): ONLY treat as base64 image if it starts with a
+    # known image magic header, has valid length/padding, and decodes cleanly.
+    if len(cleaned) >= 16 and len(cleaned) % 4 == 0:
+        for magic_prefix, mime_type in _RAW_BASE64_IMAGE_PREFIXES:
+            if cleaned.startswith(magic_prefix):
+                try:
+                    base64.b64decode(cleaned, validate=True)
+                    return mime_type, cleaned
+                except (binascii.Error, ValueError):
+                    return None
 
     return None
 
@@ -135,7 +163,9 @@ def _parse_image_part(part: dict[str, Any]) -> dict[str, Any] | None:
 
     # Direct image type: {"type": "image", "image": "..."}
     if part.get("type") == "image":
-        img_val = part.get("image") or part.get("source", {}).get("data")
+        img_val = part.get("image") or (
+            part.get("source", {}).get("data") if isinstance(part.get("source"), dict) else None
+        )
         if isinstance(img_val, str):
             parsed = _extract_base64_image_data(img_val)
             if parsed:
@@ -143,6 +173,20 @@ def _parse_image_part(part: dict[str, Any]) -> dict[str, Any] | None:
                 return {"inlineData": {"mimeType": mime_type, "data": b64_data}}
 
     return None
+
+
+def _sanitize_params_with_step_flag(
+    raw_params: dict[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Sanitize tool parameter schema and return (sanitized_schema, injected_step)."""
+    meta_fn = getattr(_schema_sanitizer, "sanitize_parameters_schema_with_meta", None)
+    if callable(meta_fn):
+        return meta_fn(raw_params)  # type: ignore[no-any-return]
+
+    params_dict = raw_params if isinstance(raw_params, dict) else {}
+    cleaned = clean_json_schema(params_dict)
+    flattened = flatten_unions(cleaned)
+    return apply_zero_required_fix(flattened)
 
 
 def sanitize_and_prepare_tools(
@@ -153,40 +197,52 @@ def sanitize_and_prepare_tools(
     Returns:
         A tuple of (gemini_tools, zero_property_tool_names) where:
         - gemini_tools is a list of [{"functionDeclarations": [...]}]
-        - zero_property_tool_names is a set of tool names requiring historical _step reinjection.
+        - zero_property_tool_names is a set of tool names where Case-1 _step was injected.
     """
     if not tools:
         return [], set()
 
-    sanitized_tools = sanitize_tools(list(tools))
     function_declarations: list[dict[str, Any]] = []
     zero_property_tools: set[str] = set()
 
-    for tool in sanitized_tools:
-        if not isinstance(tool, dict):
+    for raw_tool in tools:
+        if not isinstance(raw_tool, dict):
             continue
 
-        decl: dict[str, Any] | None = None
-        if "function" in tool and isinstance(tool["function"], dict):
-            decl = copy.deepcopy(tool["function"])
-        elif "functionDeclarations" in tool and isinstance(tool["functionDeclarations"], list):
-            for sub_decl in tool["functionDeclarations"]:
-                if isinstance(sub_decl, dict):
-                    function_declarations.append(sub_decl)
-                    # Check if sub_decl had _step injected
-                    params = sub_decl.get("parameters", {})
-                    props = params.get("properties", {})
-                    if list(props.keys()) == ["_step"]:
-                        zero_property_tools.add(sub_decl.get("name", ""))
-            continue
-        elif "name" in tool:
-            decl = copy.deepcopy(tool)
-
-        if decl:
+        if "function" in raw_tool and isinstance(raw_tool["function"], dict):
+            decl = copy.deepcopy(raw_tool["function"])
             name = str(decl.get("name", "")).strip()
-            params = decl.get("parameters", {})
-            props = params.get("properties", {}) if isinstance(params, dict) else {}
-            if list(props.keys()) == ["_step"]:
+            sanitized_params, injected_step = _sanitize_params_with_step_flag(
+                decl.get("parameters")
+            )
+            decl["parameters"] = sanitized_params
+            if injected_step and name:
+                zero_property_tools.add(name)
+            function_declarations.append(decl)
+
+        elif "functionDeclarations" in raw_tool and isinstance(
+            raw_tool["functionDeclarations"], list
+        ):
+            for raw_sub_decl in raw_tool["functionDeclarations"]:
+                if isinstance(raw_sub_decl, dict):
+                    sub_decl = copy.deepcopy(raw_sub_decl)
+                    sub_name = str(sub_decl.get("name", "")).strip()
+                    sanitized_params, injected_step = _sanitize_params_with_step_flag(
+                        sub_decl.get("parameters")
+                    )
+                    sub_decl["parameters"] = sanitized_params
+                    if injected_step and sub_name:
+                        zero_property_tools.add(sub_name)
+                    function_declarations.append(sub_decl)
+
+        elif "name" in raw_tool:
+            decl = copy.deepcopy(raw_tool)
+            name = str(decl.get("name", "")).strip()
+            sanitized_params, injected_step = _sanitize_params_with_step_flag(
+                decl.get("parameters")
+            )
+            decl["parameters"] = sanitized_params
+            if injected_step and name:
                 zero_property_tools.add(name)
             function_declarations.append(decl)
 
@@ -257,6 +313,62 @@ def _parse_tool_call_arguments(raw_args: Any) -> dict[str, Any]:
     return {}
 
 
+def _extract_images_from_tool_dict(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Extract embedded base64 images from structured tool output dicts while preserving non-image fields."""
+    cleaned_dict = copy.deepcopy(payload)
+    images: list[dict[str, Any]] = []
+
+    for key in ("inlineData", "inline_data", "image", "image_url", "b64_json", "data"):
+        if key not in cleaned_dict:
+            continue
+        val = cleaned_dict[key]
+        if key in ("inlineData", "inline_data") and isinstance(val, dict):
+            mime = val.get("mimeType") or val.get("mime_type") or "image/png"
+            data_str = val.get("data", "")
+            if isinstance(data_str, str) and data_str.strip():
+                parsed_b64 = _extract_base64_image_data(data_str)
+                b64_payload = parsed_b64[1] if parsed_b64 else data_str.strip()
+                eff_mime = parsed_b64[0] if parsed_b64 else str(mime)
+                images.append({"inlineData": {"mimeType": eff_mime, "data": b64_payload}})
+                cleaned_dict.pop(key, None)
+        elif key == "image_url":
+            if isinstance(val, dict) and isinstance(val.get("url"), str):
+                parsed_img = _extract_base64_image_data(val["url"])
+                if parsed_img:
+                    images.append(
+                        {"inlineData": {"mimeType": parsed_img[0], "data": parsed_img[1]}}
+                    )
+                    cleaned_dict.pop(key, None)
+            elif isinstance(val, str):
+                parsed_img = _extract_base64_image_data(val)
+                if parsed_img:
+                    images.append(
+                        {"inlineData": {"mimeType": parsed_img[0], "data": parsed_img[1]}}
+                    )
+                    cleaned_dict.pop(key, None)
+        elif isinstance(val, str):
+            parsed_img = _extract_base64_image_data(val)
+            if parsed_img:
+                images.append(
+                    {"inlineData": {"mimeType": parsed_img[0], "data": parsed_img[1]}}
+                )
+                cleaned_dict.pop(key, None)
+        elif isinstance(val, dict):
+            img_part = _parse_image_part(val) or _parse_image_part(
+                {"type": "image", "image": val}
+            )
+            if img_part:
+                images.append(img_part)
+                cleaned_dict.pop(key, None)
+
+    if images and not cleaned_dict:
+        cleaned_dict = {"output": "[Image Output]"}
+
+    return cleaned_dict, images
+
+
 def _resolve_tool_response_payload(raw_content: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Extract response data and any nested inlineData image parts from tool message content.
 
@@ -266,7 +378,7 @@ def _resolve_tool_response_payload(raw_content: Any) -> tuple[dict[str, Any], li
     nested_image_parts: list[dict[str, Any]] = []
 
     if isinstance(raw_content, dict):
-        return copy.deepcopy(raw_content), nested_image_parts
+        return _extract_images_from_tool_dict(raw_content)
 
     if isinstance(raw_content, str):
         cleaned = raw_content.strip()
@@ -279,7 +391,7 @@ def _resolve_tool_response_payload(raw_content: Any) -> tuple[dict[str, Any], li
         try:
             parsed = json.loads(cleaned)
             if isinstance(parsed, dict):
-                return parsed, nested_image_parts
+                return _extract_images_from_tool_dict(parsed)
             return {"output": parsed}, nested_image_parts
         except (json.JSONDecodeError, ValueError):
             return {"output": raw_content}, nested_image_parts
@@ -294,14 +406,124 @@ def _resolve_tool_response_payload(raw_content: Any) -> tuple[dict[str, Any], li
                 elif item.get("type") == "text" and "text" in item:
                     text_accum.append(str(item["text"]))
                 else:
-                    text_accum.append(json.dumps(item, ensure_ascii=False))
+                    sub_dict, sub_imgs = _extract_images_from_tool_dict(item)
+                    if sub_imgs:
+                        nested_image_parts.extend(sub_imgs)
+                    if sub_dict and sub_dict != {"output": "[Image Output]"}:
+                        text_accum.append(json.dumps(sub_dict, ensure_ascii=False))
             elif isinstance(item, str):
-                text_accum.append(item)
+                parsed_img = _extract_base64_image_data(item)
+                if parsed_img:
+                    nested_image_parts.append(
+                        {"inlineData": {"mimeType": parsed_img[0], "data": parsed_img[1]}}
+                    )
+                else:
+                    text_accum.append(item)
 
         output_str = "\n".join(text_accum) if text_accum else "[Multimodal Tool Output]"
         return {"output": output_str}, nested_image_parts
 
     return {"output": str(raw_content)}, nested_image_parts
+
+
+def _is_compaction_trigger_item(item: Any) -> bool:
+    """Return True if a message or content part represents a non-standard compaction_trigger."""
+    if isinstance(item, Mapping):
+        role = str(item.get("role", "")).strip().lower()
+        item_type = str(item.get("type", "")).strip().lower()
+        if (
+            role == "compaction_trigger"
+            or item_type == "compaction_trigger"
+            or item.get("compaction_trigger") is True
+            or "compaction_trigger" in item
+        ):
+            return True
+    elif isinstance(item, str) and item.strip().lower() == "compaction_trigger":
+        return True
+    return False
+
+
+def _convert_assistant_message_to_model_turn(
+    message: dict[str, Any],
+    *,
+    zero_tool_names: set[str],
+    tool_call_id_to_name: dict[str, str],
+    lmdb_store: LMDBStore | None,
+) -> dict[str, Any] | None:
+    """Convert an assistant/model message into a Gemini v1internal 'model' content turn."""
+    model_parts: list[dict[str, Any]] = []
+    content = message.get("content")
+    if content is None and isinstance(message.get("parts"), list):
+        content = message.get("parts")
+
+    if isinstance(content, str) and content.strip():
+        if not _is_compaction_trigger_item(content):
+            model_parts.append({"text": content})
+    elif isinstance(content, list):
+        for part in content:
+            if _is_compaction_trigger_item(part):
+                continue
+            if isinstance(part, dict) and "text" in part:
+                model_parts.append({"text": str(part["text"])})
+            elif isinstance(part, str) and part.strip():
+                model_parts.append({"text": part})
+
+    # Check for tool calls
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            call_id = str(tc.get("id", "")).strip()
+            func_info = tc.get("function", {}) if isinstance(tc.get("function"), dict) else tc
+            func_name = str(func_info.get("name", "")).strip()
+            if call_id and func_name:
+                tool_call_id_to_name[call_id] = func_name
+
+            args = _parse_tool_call_arguments(func_info.get("arguments", {}))
+
+            # ADR-05: Reinject _step: "done" ONLY for Case-1 zero-property tools
+            is_zero_property = func_name in zero_tool_names
+            args = reinject_step_to_args(args, tool_had_zero_properties=is_zero_property)
+
+            # ADR-06: Thought signature injection
+            signature: str | None = None
+            if lmdb_store and call_id:
+                signature = lmdb_store.get_signature(call_id)
+            if not signature:
+                signature = SKIP_THOUGHT_SIGNATURE_VALIDATOR
+
+            model_parts.append(
+                {
+                    "functionCall": {
+                        "name": func_name,
+                        "args": args,
+                    },
+                    "thoughtSignature": signature,
+                }
+            )
+
+    # Single legacy function_call support
+    single_fc = message.get("function_call")
+    if isinstance(single_fc, dict):
+        func_name = str(single_fc.get("name", "")).strip()
+        args = _parse_tool_call_arguments(single_fc.get("arguments", {}))
+        is_zero_property = func_name in zero_tool_names
+        args = reinject_step_to_args(args, tool_had_zero_properties=is_zero_property)
+
+        model_parts.append(
+            {
+                "functionCall": {
+                    "name": func_name,
+                    "args": args,
+                },
+                "thoughtSignature": SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+            }
+        )
+
+    if not model_parts:
+        return None
+    return {"role": "model", "parts": model_parts}
 
 
 def convert_messages_to_v1internal_contents(
@@ -314,8 +536,10 @@ def convert_messages_to_v1internal_contents(
 
     Enforces:
     - Exclusion of ``system`` and ``developer`` messages (transferred to ``systemInstruction``).
+    - Filtering of ``compaction_trigger`` messages/parts before the Post-Assembly Model-Turn Guard.
     - Mapping ``user`` -> ``user``, ``assistant`` -> ``model``, ``tool`` -> ``functionResponse``.
-    - Re-injecting ``_step: "done"`` into historical ``functionCall.args`` for zero-property tools.
+    - Coalescing consecutive ``role == "tool"`` turns into a single ``functionResponse`` turn.
+    - Re-injecting ``_step: "done"`` into historical ``functionCall.args`` ONLY for zero-property tools.
     - Injecting ``thoughtSignature`` from LMDB or defaulting to ``skip_thought_signature_validator``.
     - Tool output image nesting inside ``functionResponse.parts`` as ``inlineData``.
     - Post-Assembly Model-Turn Guard: appends ``{"role": "user", "parts": [{"text": "Continue."}]}``
@@ -326,7 +550,7 @@ def convert_messages_to_v1internal_contents(
     contents: list[dict[str, Any]] = []
 
     for message in messages:
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or _is_compaction_trigger_item(message):
             continue
 
         raw_role = str(message.get("role", "")).strip().lower()
@@ -339,11 +563,16 @@ def convert_messages_to_v1internal_contents(
         if raw_role == "user":
             user_parts: list[dict[str, Any]] = []
             content = message.get("content")
+            if content is None and isinstance(message.get("parts"), list):
+                content = message.get("parts")
 
             if isinstance(content, str):
-                user_parts.append({"text": content})
+                if not _is_compaction_trigger_item(content):
+                    user_parts.append({"text": content})
             elif isinstance(content, list):
                 for part in content:
+                    if _is_compaction_trigger_item(part):
+                        continue
                     if isinstance(part, dict):
                         img_part = _parse_image_part(part)
                         if img_part:
@@ -354,7 +583,7 @@ def convert_messages_to_v1internal_contents(
                             user_parts.append({"text": str(part["text"])})
                     elif isinstance(part, str):
                         user_parts.append({"text": part})
-            elif content is not None:
+            elif content is not None and not _is_compaction_trigger_item(content):
                 user_parts.append({"text": str(content)})
 
             if user_parts:
@@ -362,79 +591,16 @@ def convert_messages_to_v1internal_contents(
 
         # 3. Assistant / Model Message
         elif raw_role in ("assistant", "model"):
-            model_parts: list[dict[str, Any]] = []
-            content = message.get("content")
+            model_turn = _convert_assistant_message_to_model_turn(
+                message,
+                zero_tool_names=zero_tool_names,
+                tool_call_id_to_name=tool_call_id_to_name,
+                lmdb_store=lmdb_store,
+            )
+            if model_turn is not None:
+                contents.append(model_turn)
 
-            if isinstance(content, str) and content.strip():
-                model_parts.append({"text": content})
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and "text" in part:
-                        model_parts.append({"text": str(part["text"])})
-                    elif isinstance(part, str) and part.strip():
-                        model_parts.append({"text": part})
-
-            # Check for tool calls
-            tool_calls = message.get("tool_calls")
-            if isinstance(tool_calls, list):
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    call_id = str(tc.get("id", "")).strip()
-                    func_info = tc.get("function", {}) if isinstance(tc.get("function"), dict) else tc
-                    func_name = str(func_info.get("name", "")).strip()
-                    if call_id and func_name:
-                        tool_call_id_to_name[call_id] = func_name
-
-                    args = _parse_tool_call_arguments(func_info.get("arguments", {}))
-
-                    # ADR-05: Reinject _step: "done" for zero-property tools
-                    is_zero_property = (func_name in zero_tool_names) or (
-                        len(args) == 0 and not zero_tool_names
-                    )
-                    args = reinject_step_to_args(args, tool_had_zero_properties=is_zero_property)
-
-                    # ADR-06: Thought signature injection
-                    signature: str | None = None
-                    if lmdb_store and call_id:
-                        signature = lmdb_store.get_signature(call_id)
-                    if not signature:
-                        signature = SKIP_THOUGHT_SIGNATURE_VALIDATOR
-
-                    model_parts.append(
-                        {
-                            "functionCall": {
-                                "name": func_name,
-                                "args": args,
-                            },
-                            "thoughtSignature": signature,
-                        }
-                    )
-
-            # Single legacy function_call support
-            single_fc = message.get("function_call")
-            if isinstance(single_fc, dict):
-                func_name = str(single_fc.get("name", "")).strip()
-                args = _parse_tool_call_arguments(single_fc.get("arguments", {}))
-                is_zero_property = (func_name in zero_tool_names) or (
-                    len(args) == 0 and not zero_tool_names
-                )
-                args = reinject_step_to_args(args, tool_had_zero_properties=is_zero_property)
-
-                model_parts.append(
-                    {
-                        "functionCall": {
-                            "name": func_name,
-                            "args": args,
-                        },
-                        "thoughtSignature": SKIP_THOUGHT_SIGNATURE_VALIDATOR,
-                    }
-                )
-
-            if model_parts:
-                contents.append({"role": "model", "parts": model_parts})
-
-        # 4. Tool Output Message -> role: "functionResponse"
+        # 4. Tool Output Message -> role: "functionResponse" (coalesced across consecutive tool turns)
         elif raw_role == "tool":
             call_id = str(message.get("tool_call_id", "")).strip()
             tool_name = str(message.get("name", "")).strip()
@@ -453,12 +619,16 @@ def convert_messages_to_v1internal_contents(
             if nested_images:
                 func_response_obj["parts"] = nested_images
 
-            contents.append(
-                {
-                    "role": "functionResponse",
-                    "parts": [{"functionResponse": func_response_obj}],
-                }
-            )
+            new_part = {"functionResponse": func_response_obj}
+            if contents and contents[-1].get("role") == "functionResponse":
+                contents[-1].setdefault("parts", []).append(new_part)
+            else:
+                contents.append(
+                    {
+                        "role": "functionResponse",
+                        "parts": [new_part],
+                    }
+                )
 
     # 5. Post-Assembly Model-Turn Guard:
     # If contents ends with a 'model' turn, append a lightweight user 'Continue.' message
@@ -478,6 +648,53 @@ def convert_messages_to_v1internal_contents(
 # ============================================================================
 
 
+def _build_tool_config(tool_choice: Any) -> dict[str, Any] | None:
+    """Translate OpenAI tool_choice into Gemini v1internal toolConfig.functionCallingConfig."""
+    if tool_choice is None:
+        return None
+
+    if isinstance(tool_choice, str):
+        mode = tool_choice.strip().lower()
+        if mode == "none":
+            return {"functionCallingConfig": {"mode": "NONE"}}
+        if mode == "auto":
+            return {"functionCallingConfig": {"mode": "AUTO"}}
+        if mode in ("required", "any"):
+            return {"functionCallingConfig": {"mode": "ANY"}}
+        return None
+
+    if isinstance(tool_choice, Mapping):
+        if "functionCallingConfig" in tool_choice:
+            return copy.deepcopy(dict(tool_choice))
+        tc_type = str(tool_choice.get("type", "")).strip().lower()
+        if tc_type == "function" and isinstance(tool_choice.get("function"), Mapping):
+            fn_name = str(tool_choice["function"].get("name", "")).strip()
+            if fn_name:
+                return {
+                    "functionCallingConfig": {
+                        "mode": "ANY",
+                        "allowedFunctionNames": [fn_name],
+                    }
+                }
+            return {"functionCallingConfig": {"mode": "ANY"}}
+        if "name" in tool_choice:
+            fn_name = str(tool_choice.get("name", "")).strip()
+            if fn_name:
+                return {
+                    "functionCallingConfig": {
+                        "mode": "ANY",
+                        "allowedFunctionNames": [fn_name],
+                    }
+                }
+        if "mode" in tool_choice:
+            cfg: dict[str, Any] = {"mode": str(tool_choice["mode"]).strip().upper()}
+            if "allowedFunctionNames" in tool_choice:
+                cfg["allowedFunctionNames"] = list(tool_choice["allowedFunctionNames"])
+            return {"functionCallingConfig": cfg}
+
+    return None
+
+
 def build_v1internal_envelope(
     contents: list[dict[str, Any]],
     model: str,
@@ -485,9 +702,16 @@ def build_v1internal_envelope(
     project_id: str | None = None,
     system_instruction: dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any | None = None,
     generation_config: dict[str, Any] | None = None,
     request_id: str | None = None,
     reasoning_effort: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+    stop: str | Sequence[str] | None = None,
+    response_format: Mapping[str, Any] | None = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """Construct the official Cloud Code v1internal request envelope.
 
@@ -503,6 +727,11 @@ def build_v1internal_envelope(
     req_id = request_id.strip() if request_id and request_id.strip() else f"req-{uuid.uuid4().hex}"
     proj_id = project_id.strip() if project_id and project_id.strip() else ""
 
+    if "requestType" in kwargs:
+        raise ValueError(
+            "ADR-04 Violation: 'requestType' must NEVER be present in the v1internal envelope."
+        )
+
     eff_gen_config = (
         inject_oauth_thinking_config(generation_config, effort=spec.reasoning_effort)
         if generation_config is not None
@@ -511,6 +740,24 @@ def build_v1internal_envelope(
     # Ensure thinkingConfig is nested inside generationConfig
     if "thinkingConfig" not in eff_gen_config and isinstance(eff_gen_config, dict):
         eff_gen_config = {"thinkingConfig": eff_gen_config}
+
+    if temperature is not None:
+        eff_gen_config["temperature"] = float(temperature)
+    if top_p is not None:
+        eff_gen_config["topP"] = float(top_p)
+    if max_tokens is not None:
+        eff_gen_config["maxOutputTokens"] = int(max_tokens)
+    if stop is not None:
+        eff_gen_config["stopSequences"] = [stop] if isinstance(stop, str) else list(stop)
+    if response_format is not None and isinstance(response_format, Mapping):
+        rf_type = str(response_format.get("type", "")).strip().lower()
+        if rf_type == "json_object":
+            eff_gen_config["responseMimeType"] = "application/json"
+        elif rf_type == "json_schema":
+            eff_gen_config["responseMimeType"] = "application/json"
+            js_obj = response_format.get("json_schema")
+            if isinstance(js_obj, Mapping) and isinstance(js_obj.get("schema"), Mapping):
+                eff_gen_config["responseSchema"] = clean_json_schema(dict(js_obj["schema"]))
 
     req_body: dict[str, Any] = {
         "contents": copy.deepcopy(contents),
@@ -524,6 +771,9 @@ def build_v1internal_envelope(
 
     if tools:
         req_body["tools"] = copy.deepcopy(tools)
+        tool_cfg = _build_tool_config(tool_choice)
+        if tool_cfg is not None:
+            req_body["toolConfig"] = tool_cfg
 
     envelope: dict[str, Any] = {
         "project": proj_id,
@@ -540,6 +790,9 @@ def build_v1internal_envelope(
         )
 
     return envelope
+
+
+build_v1internal_request_payload = build_v1internal_envelope
 
 
 # ============================================================================
@@ -766,6 +1019,7 @@ class OAuthCLIChannel:
         request_id: str,
         http_client: httpx.AsyncClient | None = None,
         timeout: float | None = None,
+        proxy: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream chat completion chunks via HTTP/2 POST to cloudcode-pa."""
         eff_timeout = timeout or self.default_timeout
@@ -773,7 +1027,10 @@ class OAuthCLIChannel:
         client = http_client
 
         if client is None:
-            client = httpx.AsyncClient(http2=True, timeout=eff_timeout)
+            client_kwargs: dict[str, Any] = {"http2": True, "timeout": eff_timeout}
+            if proxy:
+                client_kwargs["proxy"] = proxy
+            client = httpx.AsyncClient(**client_kwargs)
             own_client = True
 
         tool_counter = 0
@@ -826,16 +1083,31 @@ class OAuthCLIChannel:
         request_id: str,
         transport: AgySubprocessTransport | None = None,
         timeout: float | None = None,
+        access_token: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream chat completion chunks via an active or ephemeral AgySubprocessTransport."""
         eff_timeout = timeout or self.default_timeout
         own_transport = False
         sub_transport = transport
 
+        sub_env: dict[str, str] | None = None
+        if access_token and access_token.strip():
+            clean_tok = access_token.strip()
+            sub_env = os.environ.copy()
+            sub_env["CLOUDCODE_ACCESS_TOKEN"] = clean_tok
+            sub_env["AGY_ACCESS_TOKEN"] = clean_tok
+
         if sub_transport is None:
-            sub_transport = AgySubprocessTransport()
+            sub_transport = AgySubprocessTransport(env=sub_env)
             await sub_transport.start()
             own_transport = True
+        elif not sub_transport.is_running:
+            if sub_env is not None:
+                merged = dict(sub_env)
+                if sub_transport.env:
+                    merged.update(sub_transport.env)
+                sub_transport.env = merged
+            await sub_transport.start()
 
         tool_counter = 0
         try:
@@ -874,12 +1146,23 @@ class OAuthCLIChannel:
         project_id: str | None = None,
         model: str = "gemini-3.8-flash",
         tools: Sequence[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         generation_config: dict[str, Any] | None = None,
         reasoning_effort: str | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+        stop: str | Sequence[str] | None = None,
+        response_format: Mapping[str, Any] | None = None,
         request_id: str | None = None,
         http_client: httpx.AsyncClient | None = None,
         transport: AgySubprocessTransport | None = None,
         timeout: float | None = None,
+        proxy: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        enable_token_saver: bool | None = None,
+        track_concurrency: bool = True,
+        **kwargs: Any,
     ) -> AsyncIterator[dict[str, Any]]:
         """Full pipeline: prepare, sanitize, assemble, and stream an OpenAI-compatible completion.
 
@@ -888,9 +1171,10 @@ class OAuthCLIChannel:
         """
         eff_request_id = request_id or f"req-{uuid.uuid4().hex}"
 
-        # 1. Resolve Access Token and Project ID
+        # 1. Resolve Access Token, Project ID, and Proxy
         eff_access_token = access_token
         eff_project_id = project_id
+        eff_proxy = proxy
         ide_type = "IDE_UNSPECIFIED"
 
         if account is not None:
@@ -901,6 +1185,8 @@ class OAuthCLIChannel:
             )
             eff_project_id = eff_project_id or account.credentials.project_id
             ide_type = account.credentials.ide_type or "IDE_UNSPECIFIED"
+            if eff_proxy is None and account.proxy:
+                eff_proxy = account.proxy
 
         if not eff_access_token or not eff_access_token.strip():
             raise ValueError("An active access_token or OAuthAccount must be provided.")
@@ -925,13 +1211,19 @@ class OAuthCLIChannel:
             project_id=eff_project_id,
             system_instruction=system_instruction,
             tools=gemini_tools,
+            tool_choice=tool_choice,
             generation_config=generation_config,
             request_id=eff_request_id,
             reasoning_effort=reasoning_effort,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            stop=stop,
+            response_format=response_format,
         )
 
         # 6. Build Official Header Shield
-        headers = build_v1internal_headers(eff_access_token, ide_type=ide_type)
+        v1_headers = build_v1internal_headers(eff_access_token, ide_type=ide_type)
 
         # 7. Dispatch to Selected Transport
         transport_mode = account.transport_mode if account else "http_v1internal"
@@ -943,16 +1235,18 @@ class OAuthCLIChannel:
                 request_id=eff_request_id,
                 transport=transport,
                 timeout=timeout,
+                access_token=eff_access_token,
             ):
                 yield chunk
         else:
             async for chunk in self.execute_http_stream(
                 envelope,
-                headers=headers,
+                headers=v1_headers,
                 model=model,
                 request_id=eff_request_id,
                 http_client=http_client,
                 timeout=timeout,
+                proxy=eff_proxy,
             ):
                 yield chunk
 
@@ -960,4 +1254,103 @@ class OAuthCLIChannel:
 # Shared singleton channel instance
 oauth_cli_channel = OAuthCLIChannel()
 default_oauth_cli_channel = oauth_cli_channel
+
+
+async def execute_v1internal_sse_stream(
+    messages: Sequence[dict[str, Any]] | dict[str, Any],
+    *,
+    account: OAuthAccount | None = None,
+    access_token: str | None = None,
+    project_id: str | None = None,
+    model: str = "gemini-3.8-flash",
+    tools: Sequence[dict[str, Any]] | None = None,
+    tool_choice: Any | None = None,
+    generation_config: dict[str, Any] | None = None,
+    reasoning_effort: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+    stop: str | Sequence[str] | None = None,
+    response_format: Mapping[str, Any] | None = None,
+    request_id: str | None = None,
+    http_client: httpx.AsyncClient | None = None,
+    transport: AgySubprocessTransport | None = None,
+    timeout: float | None = None,
+    proxy: str | None = None,
+    headers: dict[str, str] | None = None,
+    lmdb_store: LMDBStore | None = None,
+    **kwargs: Any,
+) -> AsyncIterator[dict[str, Any]]:
+    """Module-level helper for executing a v1internal SSE stream."""
+    channel = OAuthCLIChannel(lmdb_store=lmdb_store) if lmdb_store else oauth_cli_channel
+    eff_proxy = proxy or (account.proxy if account and account.proxy else None)
+
+    if isinstance(messages, dict) and "request" in messages and "model" in messages:
+        req_id = request_id or str(messages.get("requestId", f"req-{uuid.uuid4().hex}"))
+        eff_headers = headers
+        if eff_headers is None:
+            tok = access_token or (account.credentials.access_token if account else "")
+            ide = account.credentials.ide_type if account else "IDE_UNSPECIFIED"
+            eff_headers = build_v1internal_headers(tok, ide_type=ide)
+        async for chunk in channel.execute_http_stream(
+            messages,
+            headers=eff_headers,
+            model=model,
+            request_id=req_id,
+            http_client=http_client,
+            timeout=timeout,
+            proxy=eff_proxy,
+        ):
+            yield chunk
+        return
+
+    async for chunk in channel.stream_chat(
+        messages=messages,  # type: ignore[arg-type]
+        account=account,
+        access_token=access_token,
+        project_id=project_id,
+        model=model,
+        tools=tools,
+        tool_choice=tool_choice,
+        generation_config=generation_config,
+        reasoning_effort=reasoning_effort,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        stop=stop,
+        response_format=response_format,
+        request_id=request_id,
+        http_client=http_client,
+        transport=transport,
+        timeout=timeout,
+        proxy=eff_proxy,
+        headers=headers,
+        **kwargs,
+    ):
+        yield chunk
+
+
+async def execute_subprocess_stream(
+    envelope: dict[str, Any],
+    *,
+    model: str = "gemini-3.8-flash",
+    request_id: str | None = None,
+    transport: AgySubprocessTransport | None = None,
+    timeout: float | None = None,
+    access_token: str | None = None,
+    lmdb_store: LMDBStore | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Module-level helper for executing a subprocess stream with optional access_token injection."""
+    channel = OAuthCLIChannel(lmdb_store=lmdb_store) if lmdb_store else oauth_cli_channel
+    eff_req_id = request_id or str(envelope.get("requestId", f"req-{uuid.uuid4().hex}"))
+    async for chunk in channel.execute_subprocess_stream(
+        envelope,
+        model=model,
+        request_id=eff_req_id,
+        transport=transport,
+        timeout=timeout,
+        access_token=access_token,
+    ):
+        yield chunk
+
 

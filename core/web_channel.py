@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from enum import Enum
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -49,11 +50,15 @@ from config.settings import (
     get_lmdb_store,
     get_model_base_delta,
 )
+import core.auth_web as _auth_web
 from core.auth_web import WebSessionManager
+from core.model_registry import parse_model_and_effort
 from core.prefix_differ import (
     compute_messages_char_length,
     execute_rehydrated_stream,
 )
+import core.usage_monitor as _usage_monitor
+from core.usage_monitor import check_and_apply_drift_safe_resets
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +71,12 @@ TOOL_CALL_OPEN_RE: Final[re.Pattern[str]] = re.compile(
     r"<tool_call\b([^>]*)>", re.IGNORECASE
 )
 TOOL_CALL_CLOSE_TAG: Final[str] = "</tool_call>"
+_OPENING_FENCE_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(
+    r"```[a-zA-Z0-9_-]*\s*$"
+)
+_UNCLOSED_TOOL_TAG_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:```[a-zA-Z0-9_-]*\s*)?<tool_call\b[^>]*$", re.IGNORECASE
+)
 
 # Whitespace and newline characters dropped between consecutive tool calls (ADR-09)
 _WHITESPACE_CHARS: Final[frozenset[str]] = frozenset({" ", "\t", "\r", "\n"})
@@ -422,6 +433,22 @@ class MultiToolLookaheadParser:
                     current_buf_str = "".join(self._lookahead_buffer)
                     match = TOOL_CALL_OPEN_RE.search(current_buf_str)
                     if match:
+                        # Emit any non-fence text preceding the opening <tool_call...> tag
+                        raw_prefix = current_buf_str[: match.start()]
+                        if raw_prefix and not self.has_emitted_tool_call:
+                            fence_match = _OPENING_FENCE_SUFFIX_RE.search(raw_prefix)
+                            prefix_before_fence = (
+                                raw_prefix[: fence_match.start()]
+                                if fence_match
+                                else raw_prefix
+                            )
+                            if prefix_before_fence:
+                                deltas.append(
+                                    StreamDelta(
+                                        content=prefix_before_fence, role="assistant"
+                                    )
+                                )
+
                         # Opening tag found! Transition to TOOL_CAPTURING
                         self._active_tag_name_attr = ""
                         attr_match = re.search(r'name=["\']([^"\']+)["\']', match.group(1))
@@ -437,6 +464,22 @@ class MultiToolLookaheadParser:
 
                     # Check if 64-character buffer capacity reached
                     if len(self._lookahead_buffer) >= self.capacity:
+                        unclosed_match = _UNCLOSED_TOOL_TAG_SUFFIX_RE.search(current_buf_str)
+                        if unclosed_match:
+                            if unclosed_match.start() > 0:
+                                to_flush = current_buf_str[: unclosed_match.start()]
+                                self._lookahead_buffer = list(
+                                    current_buf_str[unclosed_match.start() :]
+                                )
+                                if to_flush and not self.has_emitted_tool_call:
+                                    deltas.append(
+                                        StreamDelta(content=to_flush, role="assistant")
+                                    )
+                                continue
+                            if len(self._lookahead_buffer) < self.capacity * 4:
+                                # Allow <tool_call ...> with attributes to finish closing '>'
+                                continue
+
                         matched_sfx_len = 0
                         for sfx in _POTENTIAL_TAG_PREFIXES:
                             if current_buf_str.endswith(sfx):
@@ -547,12 +590,16 @@ def compute_context_scaled_delta_5h(
 
     Formula (from 03_SCHEDULING_AND_CONTROL_SPEC.md):
     ``Delta_5h(m, L_chars) = Delta_base(m) * (1.0 + 0.25 * (L_chars / 25000))``
+    Strips any reasoning effort suffix and caps ``gemini-3.1-pro`` at ``0.09``.
     """
-    base_delta = get_model_base_delta(model_name)
+    base_model = parse_model_and_effort(str(model_name)).base_model
+    base_delta = get_model_base_delta(base_model)
     if base_delta <= 0.0:
         return 0.0
     safe_chars = max(0, context_chars)
     scaled_delta = base_delta * (1.0 + 0.25 * (safe_chars / 25000.0))
+    if base_model == "gemini-3.1-pro":
+        scaled_delta = min(0.09, scaled_delta)
     return scaled_delta
 
 
@@ -587,38 +634,53 @@ async def execute_web_channel_stream(
     messages: Sequence[Mapping[str, Any]],
     *,
     model: str | Any = "gemini-4-argon",
+    reasoning_effort: str | None = None,
     system_prompt: str = "",
     tools: Sequence[Mapping[str, Any]] | None = None,
+    tool_choice: Any | None = None,
     headers: Mapping[str, str] | None = None,
     request_id: str | None = None,
-    enable_token_saver: bool = True,
+    enable_token_saver: bool | None = True,
     enable_waf_shield: bool = True,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+    response_format: Mapping[str, Any] | None = None,
     lmdb_store: LMDBStore | None = None,
     temp_dir: Path | str | None = None,
     as_dict: bool = False,
+    track_concurrency: bool = True,
+    time_fn: Callable[[], float] = time.time,
+    **kwargs: Any,
 ) -> AsyncIterator[StreamChunk | dict[str, Any]]:
     """Stream response from Google AI Pro Web Pool with 3-tier rehydration and lookahead parsing.
 
     Key guarantees:
-    1. Active requests increment on start, decrement in ``finally:``.
-    2. Concurrent live reasoning: streams ``chunk.thoughts`` immediately as ``reasoning_content``.
+    1. Active requests increment on start and decrement in ``finally:`` when ``track_concurrency=True``.
+    2. Concurrent live reasoning: streams ``chunk.thoughts`` immediately as ``reasoning_content``
+       with cumulative prefix deduplication.
     3. MultiToolLookaheadParser filters XML tool blocks, dropping interstitial noise (ADR-09).
-    4. Upon successful completion: increments ``account.optimistic_5h_delta`` with context-scaled
-       ``Delta_5h`` and updates ``_last_completed_timestamp``.
+    4. Upon successful completion: applies drift-safe resets, increments ``account.optimistic_5h_delta``
+       and ``account.optimistic_weekly_delta``, resets consecutive errors, and persists rotated cookies.
     """
     rid = request_id or f"chatcmpl-{uuid4().hex}"
     model_str = str(model) if model else "gemini-4-argon"
+    resolved_spec = parse_model_and_effort(model_str, reasoning_effort=reasoning_effort)
+    base_model = resolved_spec.base_model
+    eff_token_saver = True if enable_token_saver is None else bool(enable_token_saver)
 
     # Track request start & concurrency
-    account.active_requests += 1
-    start_time = time.time()
-    account.last_started_timestamp = start_time
-    if hasattr(account, "_last_started_timestamp"):
-        account._last_started_timestamp = start_time
+    start_time = float(time_fn())
+    if account is not None:
+        if track_concurrency:
+            account.active_requests += 1
+        account.last_started_timestamp = start_time
+        if hasattr(account, "_last_started_timestamp"):
+            account._last_started_timestamp = start_time
 
     parser = MultiToolLookaheadParser(capacity=LOOKAHEAD_BUFFER_CAPACITY)
     accumulated_text_len = 0
-    seen_thoughts: str = ""
+    emitted_thoughts_prefix: str = ""
     stream_succeeded = False
 
     try:
@@ -626,11 +688,11 @@ async def execute_web_channel_stream(
             account=account,
             client=client,
             messages=messages,
-            model=model,
+            model=base_model if isinstance(model, str) else model,
             system_prompt=system_prompt,
             tools=tools,
             headers=headers,
-            enable_token_saver=enable_token_saver,
+            enable_token_saver=eff_token_saver,
             enable_waf_shield=enable_waf_shield,
             lmdb_store=lmdb_store,
             temp_dir=temp_dir,
@@ -640,6 +702,7 @@ async def execute_web_channel_stream(
             # 1. Live Reasoning Stream: emit incremental thoughts immediately
             thought_delta = getattr(chunk, "thoughts_delta", None)
             if isinstance(thought_delta, str) and thought_delta:
+                emitted_thoughts_prefix += thought_delta
                 c = _build_chunk(
                     rid,
                     model_str,
@@ -647,10 +710,20 @@ async def execute_web_channel_stream(
                 )
                 yield c.to_dict() if as_dict else c
             else:
-                full_thoughts = getattr(chunk, "thoughts", None)
-                if isinstance(full_thoughts, str) and len(full_thoughts) > len(seen_thoughts):
-                    new_thought = full_thoughts[len(seen_thoughts):]
-                    seen_thoughts = full_thoughts
+                raw_thoughts = getattr(chunk, "thoughts", None)
+                if isinstance(raw_thoughts, str) and raw_thoughts:
+                    if emitted_thoughts_prefix and raw_thoughts.startswith(
+                        emitted_thoughts_prefix
+                    ):
+                        new_thought = raw_thoughts[len(emitted_thoughts_prefix) :]
+                        emitted_thoughts_prefix = raw_thoughts
+                    else:
+                        new_thought = raw_thoughts
+                        emitted_thoughts_prefix = (
+                            raw_thoughts
+                            if not emitted_thoughts_prefix
+                            else emitted_thoughts_prefix + raw_thoughts
+                        )
                     if new_thought:
                         c = _build_chunk(
                             rid,
@@ -690,28 +763,108 @@ async def execute_web_channel_stream(
         stream_succeeded = True
 
     finally:
-        account.active_requests = max(0, account.active_requests - 1)
-        if stream_succeeded:
-            end_time = time.time()
+        end_time = float(time_fn())
+        if account is not None:
+            if track_concurrency:
+                account.active_requests = max(0, account.active_requests - 1)
             account.last_completed_timestamp = end_time
             if hasattr(account, "_last_completed_timestamp"):
                 account._last_completed_timestamp = end_time
 
-            context_chars = compute_messages_char_length(
-                messages, system_prompt=system_prompt, tools=tools
-            )
-            delta_5h = compute_context_scaled_delta_5h(model_str, context_chars)
-            account.optimistic_5h_delta += delta_5h
-            logger.info(
-                "Web channel turn completed successfully for account '%s' "
-                "(model: %s, context: %d chars). Added delta_5h: +%.5f -> "
-                "total optimistic_5h_delta: %.5f",
-                account.id,
-                model_str,
-                context_chars,
-                delta_5h,
-                account.optimistic_5h_delta,
-            )
+            if stream_succeeded:
+                # 1. Drift-safe reset check before accumulating new deltas
+                try:
+                    check_and_apply_drift_safe_resets(
+                        account, current_time=end_time  # type: ignore[call-arg]
+                    )
+                except TypeError:
+                    check_and_apply_drift_safe_resets(account, now=end_time)
+
+                # 2. Compute and accumulate 5h and weekly optimistic deltas
+                context_chars = compute_messages_char_length(
+                    messages, system_prompt=system_prompt, tools=tools
+                )
+                delta_5h = compute_context_scaled_delta_5h(base_model, context_chars)
+                account.optimistic_5h_delta += delta_5h
+
+                compute_weekly_fn = getattr(
+                    _usage_monitor, "compute_optimistic_weekly_delta", None
+                )
+                if callable(compute_weekly_fn):
+                    try:
+                        delta_weekly = float(compute_weekly_fn(delta_5h))
+                    except TypeError:
+                        delta_weekly = float(compute_weekly_fn(base_model, context_chars))
+                else:
+                    delta_weekly = round(delta_5h * 0.25, 6)
+                account.optimistic_weekly_delta += delta_weekly
+
+                # 3. Reset error tracking state
+                account.consecutive_errors = 0
+                account.last_error_reason = None
+
+                # 4. Persist rotated cookies if client carries updated cookies
+                if client is not None:
+                    try:
+                        extract_fn = getattr(_auth_web, "extract_cookies_from_client", None)
+                        if callable(extract_fn):
+                            extracted = extract_fn(client)
+                        else:
+                            extracted = _auth_web.extract_client_web_cookies(client)
+
+                        has_cookies = False
+                        if isinstance(extracted, Mapping):
+                            psid = str(
+                                extracted.get("__Secure-1PSID")
+                                or extracted.get("secure_1psid")
+                                or ""
+                            ).strip()
+                            psidts = str(
+                                extracted.get("__Secure-1PSIDTS")
+                                or extracted.get("secure_1psidts")
+                                or ""
+                            ).strip()
+                            if psid:
+                                account.cookies.secure_1psid = psid
+                                if psidts:
+                                    account.cookies.secure_1psidts = psidts
+                                has_cookies = True
+                        elif hasattr(extracted, "secure_1psid"):
+                            psid = str(getattr(extracted, "secure_1psid", "")).strip()
+                            psidts = str(getattr(extracted, "secure_1psidts", "")).strip()
+                            if psid:
+                                account.cookies.secure_1psid = psid
+                                if psidts:
+                                    account.cookies.secure_1psidts = psidts
+                                has_cookies = True
+
+                        if has_cookies:
+                            try:
+                                save_res = _auth_web.save_account_cookies_isolated(
+                                    account, client=client
+                                )
+                            except TypeError:
+                                save_res = _auth_web.save_account_cookies_isolated(account)
+                            if inspect.isawaitable(save_res):
+                                await save_res
+                    except Exception as cookie_exc:
+                        logger.debug(
+                            "Skipping post-stream cookie persistence for account '%s': %s",
+                            account.id,
+                            cookie_exc,
+                        )
+
+                logger.info(
+                    "Web channel turn completed successfully for account '%s' "
+                    "(model: %s, context: %d chars). Added delta_5h: +%.5f -> "
+                    "total optimistic_5h_delta: %.5f, optimistic_weekly_delta: %.5f",
+                    account.id,
+                    base_model,
+                    context_chars,
+                    delta_5h,
+                    account.optimistic_5h_delta,
+                    account.optimistic_weekly_delta,
+                )
 
 
 # ============================================================================
@@ -741,13 +894,22 @@ class WebChannel:
         *,
         client: Any | None = None,
         model: str | Any = "gemini-4-argon",
+        reasoning_effort: str | None = None,
         system_prompt: str = "",
         tools: Sequence[Mapping[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         headers: Mapping[str, str] | None = None,
         request_id: str | None = None,
-        enable_token_saver: bool = True,
+        enable_token_saver: bool | None = True,
         enable_waf_shield: bool = True,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+        response_format: Mapping[str, Any] | None = None,
         as_dict: bool = False,
+        track_concurrency: bool = True,
+        time_fn: Callable[[], float] = time.time,
+        **kwargs: Any,
     ) -> AsyncIterator[StreamChunk | dict[str, Any]]:
         """Execute a streaming chat completion turn via the Web Cookie Pool."""
         active_client = client
@@ -763,15 +925,24 @@ class WebChannel:
             client=active_client,
             messages=messages,
             model=model,
+            reasoning_effort=reasoning_effort,
             system_prompt=system_prompt,
             tools=tools,
+            tool_choice=tool_choice,
             headers=headers,
             request_id=request_id,
             enable_token_saver=enable_token_saver,
             enable_waf_shield=enable_waf_shield,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            response_format=response_format,
             lmdb_store=self.lmdb_store,
             temp_dir=self.temp_dir,
             as_dict=as_dict,
+            track_concurrency=track_concurrency,
+            time_fn=time_fn,
+            **kwargs,
         ):
             yield chunk
 

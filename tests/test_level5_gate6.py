@@ -519,8 +519,8 @@ async def test_gate6_chat_completion_token_saver_header_control(
 
     test_app.dependency_overrides[get_failover_controller] = lambda: CapturingController(registry=state_registry)
 
-    # Verbose tool output payload
-    large_tool_output = json.dumps({"items": [{"id": i, "data": f"verbose payload value {i}"} for i in range(100)]})
+    # Verbose tool output payload with repetitive lines to verify RTK-Lite compression
+    large_tool_output = "\n".join(["[INFO] build step redundant log entry running task"] * 50)
     request_messages = [
         {"role": "user", "content": "Fetch records"},
         {"role": "assistant", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_data", "arguments": "{}"}}]},
@@ -548,7 +548,7 @@ async def test_gate6_chat_completion_token_saver_header_control(
     verbatim_tool_content = captured_messages[1][2]["content"]
 
     # When ON, size must be compressed / sanitized; when OFF, must match original verbatim string
-    assert len(sanitized_tool_content) <= len(large_tool_output)
+    assert len(sanitized_tool_content) < len(large_tool_output)
     assert verbatim_tool_content == large_tool_output
 
 

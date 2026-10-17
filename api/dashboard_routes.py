@@ -26,11 +26,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from config.settings import (
     BASE_DIR,
     COOKIES_CACHE_DIR,
+    DEFAULT_MODEL_ROUTES,
+    ModelRouteConfig,
     OAuthAccount,
     OAuthCredentials,
     WebAccount,
     WebCookies,
+    get_custom_model_routes,
     save_accounts_snapshot,
+    save_custom_model_routes,
     state_registry,
 )
 from core.auth_oauth_cli import (
@@ -53,6 +57,7 @@ from core.hybrid_scheduler import (
     calculate_soonest_reset_urgency,
     calculate_web_account_score,
     calculate_web_concurrency_denominator,
+    get_model_channel_preference,
 )
 from core.model_registry import discover_oauth_models, unified_model_registry
 from core.usage_monitor import sync_all_registered_accounts
@@ -123,6 +128,18 @@ class WebAccountAddRequest(BaseModel):
     secure_1psidts: str = ""
     proxy: str | None = None
     max_concurrency: int = Field(default=2, ge=1, le=8)
+
+
+class ModelRouteUpdateRequest(BaseModel):
+    """Payload for updating or creating a model channel route."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    model: str
+    primary_channel: Literal["oauth", "web"] = Field(alias="primary")
+    failover_channel: Literal["oauth", "web", "none", "None"] | None = Field(
+        default=None, alias="failover"
+    )
 
 
 # ============================================================================
@@ -431,6 +448,11 @@ async def delete_oauth_account(account_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"OAuth account '{validated_id}' not found.")
 
     state_registry.remove_oauth_account(validated_id)
+    try:
+        from config.settings import get_lmdb_store
+        get_lmdb_store().delete_sessions_for_account(validated_id)
+    except Exception:
+        pass
     await save_accounts_snapshot()
     return {"success": True, "message": f"OAuth account '{validated_id}' deleted successfully."}
 
@@ -458,6 +480,13 @@ async def add_web_account(payload: WebAccountAddRequest) -> dict[str, Any]:
     state_registry.upsert_web_account(account)
     await save_accounts_snapshot()
 
+    try:
+        from core.auth_web import default_web_session_manager
+        from core.usage_monitor import sync_web_account_usage
+        await sync_web_account_usage(account, session_manager=default_web_session_manager)
+    except Exception:
+        pass
+
     return {
         "success": True,
         "message": f"Web account '{validated_id}' registered successfully.",
@@ -474,6 +503,17 @@ async def delete_web_account(account_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Web account '{validated_id}' not found.")
 
     state_registry.remove_web_account(validated_id)
+    try:
+        from core.auth_web import default_web_session_manager
+        await default_web_session_manager.close_client(validated_id)
+    except Exception:
+        pass
+    try:
+        from config.settings import get_lmdb_store
+        get_lmdb_store().delete_sessions_for_account(validated_id)
+    except Exception:
+        pass
+
     cookie_path = get_account_cookie_cache_path(validated_id)
     if cookie_path.exists():
         try:
@@ -492,6 +532,152 @@ async def sync_accounts_quotas() -> dict[str, Any]:
     return {
         "success": True,
         "report": report,
+    }
+
+
+# ============================================================================
+# 3. Dynamic Model Routing & Compute Allocation
+# ============================================================================
+
+
+@router.get("/model-routes")
+async def get_model_routes() -> dict[str, Any]:
+    """Return all discovered models and custom alias routes with effective channel preferences."""
+    custom_routes = get_custom_model_routes()
+    base_models = unified_model_registry.get_base_models()
+
+    routes: list[dict[str, Any]] = []
+    seen_models: set[str] = set()
+
+    # 1. Models dynamically discovered by UnifiedModelRegistry
+    for model_id in base_models:
+        clean_id = model_id.strip().lower()
+        if clean_id in seen_models:
+            continue
+        seen_models.add(clean_id)
+        primary, failover = get_model_channel_preference(clean_id)
+        is_custom = clean_id in custom_routes
+        support = unified_model_registry.get_supporting_accounts(clean_id, active_only=False)
+        routes.append({
+            "model": clean_id,
+            "primary_channel": primary,
+            "failover_channel": failover,
+            "primary": primary,
+            "failover": failover,
+            "is_custom": is_custom,
+            "is_discovered": True,
+            "supporting_accounts": {
+                "oauth": len(support.get("oauth", [])),
+                "web": len(support.get("web", [])),
+            },
+        })
+
+    # 2. Custom aliases not included in base_models (e.g. main_agent, sub_agent, gpt-4o)
+    for alias_name, alias_route in custom_routes.items():
+        clean_alias = alias_name.strip().lower()
+        if clean_alias in seen_models:
+            continue
+        seen_models.add(clean_alias)
+        primary, failover = get_model_channel_preference(clean_alias)
+        support = unified_model_registry.get_supporting_accounts(clean_alias, active_only=False)
+        routes.append({
+            "model": clean_alias,
+            "primary_channel": primary,
+            "failover_channel": failover,
+            "primary": primary,
+            "failover": failover,
+            "is_custom": True,
+            "is_discovered": False,
+            "supporting_accounts": {
+                "oauth": len(support.get("oauth", [])),
+                "web": len(support.get("web", [])),
+            },
+        })
+
+    return {
+        "success": True,
+        "routes": routes,
+        "custom_routes": custom_routes,
+        "default_routes": DEFAULT_MODEL_ROUTES,
+    }
+
+
+@router.post("/model-routes")
+async def update_model_route(payload: ModelRouteUpdateRequest) -> dict[str, Any]:
+    """Create or update a model routing configuration."""
+    model_name = payload.model.strip().lower()
+    if not model_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Model identifier cannot be empty.",
+        )
+
+    primary = payload.primary_channel
+    failover_raw = payload.failover_channel
+    failover: Literal["oauth", "web"] | None = None
+    if failover_raw is not None:
+        f_str = str(failover_raw).strip().lower()
+        if f_str in ("oauth", "web"):
+            failover = f_str  # type: ignore[assignment]
+
+    if failover == primary:
+        failover = None
+
+    custom_routes = get_custom_model_routes()
+    custom_routes[model_name] = {
+        "primary": primary,
+        "failover": failover,
+        "primary_channel": primary,
+        "failover_channel": failover,
+    }
+    save_custom_model_routes(custom_routes)
+
+    return {
+        "success": True,
+        "message": f"Route for model '{model_name}' updated successfully.",
+        "route": {
+            "model": model_name,
+            "primary_channel": primary,
+            "failover_channel": failover,
+            "primary": primary,
+            "failover": failover,
+            "is_custom": True,
+        },
+        "custom_routes": custom_routes,
+    }
+
+
+@router.delete("/model-routes/{model:path}")
+async def delete_model_route(model: str) -> dict[str, Any]:
+    """Remove a custom model route override."""
+    model_name = model.strip().lower()
+    custom_routes = get_custom_model_routes()
+
+    target_key = None
+    if model_name in custom_routes:
+        target_key = model_name
+    else:
+        for k in custom_routes:
+            if k.lower() == model_name:
+                target_key = k
+                break
+
+    if target_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Custom route for model '{model}' not found.",
+        )
+
+    custom_routes.pop(target_key, None)
+    save_custom_model_routes(custom_routes)
+
+    eff_primary, eff_failover = get_model_channel_preference(model_name)
+    return {
+        "success": True,
+        "message": f"Custom route for model '{model_name}' deleted successfully.",
+        "model": model_name,
+        "effective_primary_channel": eff_primary,
+        "effective_failover_channel": eff_failover,
     }
 
 

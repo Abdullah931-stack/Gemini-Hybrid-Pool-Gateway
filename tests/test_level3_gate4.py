@@ -807,10 +807,9 @@ def test_v1internal_envelope_raises_error_if_request_type_injected() -> None:
 
     # If tampered with
     with pytest.raises(ValueError, match="ADR-04"):
-        envelope_bad = dict(envelope)
-        envelope_bad["requestType"] = "agent"
-        if "requestType" in envelope_bad:
-            raise ValueError("ADR-04 Violation: 'requestType' must NEVER be present")
+        build_v1internal_envelope(
+            contents=contents, model="gemini-3.8-flash", requestType="agent"
+        )
 
 
 def test_multi_tool_parser_adr09_no_delimiter_text_leak_after_tool_starts() -> None:

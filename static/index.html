@@ -1,0 +1,1211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gemini Hybrid Pool Gateway | Control Dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>" />
+  <style>
+    :root {
+      --bg-dark: #070b12;
+      --bg-card: #0f172a;
+      --bg-card-hover: #162036;
+      --bg-card-subtle: #1e293b;
+      --border-color: #24344d;
+      --border-light: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --accent-cyan: #38bdf8;
+      --accent-cyan-glow: rgba(56, 189, 248, 0.25);
+      --accent-blue: #3b82f6;
+      --accent-green: #10b981;
+      --accent-green-glow: rgba(16, 185, 129, 0.25);
+      --accent-amber: #f59e0b;
+      --accent-amber-glow: rgba(245, 158, 11, 0.25);
+      --accent-rose: #f43f5e;
+      --accent-rose-glow: rgba(244, 63, 94, 0.25);
+      --accent-purple: #a855f7;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 16px;
+      --shadow-card: 0 4px 20px -2px rgba(0, 0, 0, 0.5);
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      min-height: 100vh;
+      line-height: 1.5;
+      padding-bottom: 3rem;
+    }
+
+    /* Container */
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 1.5rem 2rem;
+    }
+
+    /* Header */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 1.5rem;
+      border-bottom: 1px solid var(--border-color);
+      margin-bottom: 2rem;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+    }
+    .brand-icon {
+      font-size: 2rem;
+      background: linear-gradient(135deg, #38bdf8, #818cf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .brand-text h1 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .brand-text p {
+      font-size: 0.82rem;
+      color: var(--text-muted);
+    }
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.55rem 1rem;
+      font-size: 0.84rem;
+      font-weight: 600;
+      border-radius: var(--radius-sm);
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      text-decoration: none;
+    }
+    .btn-primary {
+      background: #0284c7;
+      color: #fff;
+    }
+    .btn-primary:hover { background: #0369a1; }
+    .btn-success {
+      background: #059669;
+      color: #fff;
+    }
+    .btn-success:hover { background: #047857; }
+    .btn-outline {
+      background: transparent;
+      border-color: var(--border-light);
+      color: var(--text-main);
+    }
+    .btn-outline:hover {
+      background: var(--bg-card-subtle);
+      border-color: var(--accent-cyan);
+    }
+    .btn-danger {
+      background: rgba(244, 63, 94, 0.15);
+      border-color: rgba(244, 63, 94, 0.3);
+      color: var(--accent-rose);
+    }
+    .btn-danger:hover {
+      background: var(--accent-rose);
+      color: #fff;
+    }
+    .btn-sm {
+      padding: 0.3rem 0.65rem;
+      font-size: 0.75rem;
+    }
+
+    /* Auto-refresh toggle */
+    .toggle-wrapper {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      padding: 0.4rem 0.85rem;
+      border-radius: var(--radius-sm);
+    }
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 34px;
+      height: 18px;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+      background-color: var(--border-light);
+      transition: .3s;
+      border-radius: 20px;
+    }
+    .slider:before {
+      position: absolute; content: ""; height: 12px; width: 12px; left: 3px; bottom: 3px;
+      background-color: white;
+      transition: .3s;
+      border-radius: 50%;
+    }
+    input:checked + .slider { background-color: var(--accent-cyan); }
+    input:checked + .slider:before { transform: translateX(16px); }
+
+    /* KPI Grid */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1.25rem;
+      margin-bottom: 2rem;
+    }
+    .kpi-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 1.25rem;
+      box-shadow: var(--shadow-card);
+      position: relative;
+      overflow: hidden;
+      transition: transform 0.2s, border-color 0.2s;
+    }
+    .kpi-card:hover {
+      border-color: var(--border-light);
+      transform: translateY(-2px);
+    }
+    .kpi-card::before {
+      content: "";
+      position: absolute;
+      top: 0; left: 0; right: 0; height: 3px;
+    }
+    .kpi-card.status-healthy::before { background: var(--accent-green); box-shadow: 0 0 10px var(--accent-green); }
+    .kpi-card.status-degraded::before { background: var(--accent-amber); box-shadow: 0 0 10px var(--accent-amber); }
+    .kpi-card.status-empty::before { background: var(--text-dim); }
+    .kpi-title {
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 0.4rem;
+    }
+    .kpi-value {
+      font-size: 1.75rem;
+      font-weight: 700;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+    .kpi-subtitle {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      margin-top: 0.4rem;
+    }
+
+    /* Badges */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.2rem 0.6rem;
+      border-radius: 9999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .badge-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+    .badge-active {
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--accent-green);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+    .badge-active .badge-dot {
+      background: var(--accent-green);
+      box-shadow: 0 0 6px var(--accent-green);
+      animation: pulse 2s infinite;
+    }
+    .badge-cooldown {
+      background: rgba(245, 158, 11, 0.15);
+      color: var(--accent-amber);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+    .badge-cooldown .badge-dot { background: var(--accent-amber); }
+    .badge-suspended {
+      background: rgba(244, 63, 94, 0.15);
+      color: var(--accent-rose);
+      border: 1px solid rgba(244, 63, 94, 0.3);
+    }
+    .badge-suspended .badge-dot { background: var(--accent-rose); }
+    .badge-tier {
+      background: rgba(168, 85, 247, 0.15);
+      color: var(--accent-purple);
+      border: 1px solid rgba(168, 85, 247, 0.3);
+      font-family: var(--font-mono);
+    }
+
+    @keyframes pulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(1.2); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+
+    /* Sections */
+    .section-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+    .section-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+    .section-title span.count {
+      font-size: 0.8rem;
+      background: var(--bg-card-subtle);
+      color: var(--accent-cyan);
+      padding: 0.15rem 0.55rem;
+      border-radius: 9999px;
+      font-weight: 600;
+    }
+
+    /* Pool Grid & Cards */
+    .pool-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+      gap: 1.25rem;
+      margin-bottom: 2.5rem;
+    }
+    .account-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 1.25rem;
+      box-shadow: var(--shadow-card);
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      position: relative;
+    }
+    .account-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 0.5rem;
+    }
+    .account-id {
+      font-family: var(--font-mono);
+      font-weight: 600;
+      font-size: 0.95rem;
+      color: var(--accent-cyan);
+    }
+    .account-label {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+    }
+    .account-metrics-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0.5rem;
+      background: var(--bg-card-subtle);
+      padding: 0.6rem;
+      border-radius: var(--radius-sm);
+      text-align: center;
+    }
+    .metric-item-label {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+    .metric-item-value {
+      font-size: 0.9rem;
+      font-weight: 700;
+      color: var(--text-main);
+      font-family: var(--font-mono);
+    }
+
+    /* Progress Bars */
+    .quota-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+    }
+    .progress-bar-wrapper {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.75rem;
+    }
+    .progress-title { color: var(--text-muted); }
+    .progress-pct {
+      font-family: var(--font-mono);
+      font-weight: 600;
+      color: var(--text-main);
+    }
+    .progress-track {
+      height: 8px;
+      background: #1e293b;
+      border-radius: 9999px;
+      overflow: hidden;
+      position: relative;
+    }
+    .progress-fill {
+      height: 100%;
+      border-radius: 9999px;
+      transition: width 0.4s ease;
+    }
+    .fill-green { background: linear-gradient(90deg, #059669, #10b981); }
+    .fill-amber { background: linear-gradient(90deg, #d97706, #f59e0b); }
+    .fill-rose { background: linear-gradient(90deg, #e11d48, #f43f5e); }
+
+    .models-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+    }
+    .pill {
+      font-size: 0.7rem;
+      font-family: var(--font-mono);
+      background: rgba(56, 189, 248, 0.1);
+      color: var(--accent-cyan);
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      border: 1px solid rgba(56, 189, 248, 0.2);
+    }
+
+    /* Agent Connect Card */
+    .agent-connect-card {
+      background: linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(30, 41, 59, 0.8));
+      border: 1px solid var(--accent-cyan-glow);
+      border-radius: var(--radius-lg);
+      padding: 1.5rem;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+      margin-bottom: 2.5rem;
+      position: relative;
+      overflow: hidden;
+    }
+    .agent-connect-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+    .agent-connect-header h3 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: #38bdf8;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .connect-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.25rem;
+    }
+    .connect-input-box {
+      background: var(--bg-dark);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      padding: 0.5rem 0.75rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .connect-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 0.2rem;
+    }
+    .connect-value {
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      color: var(--text-main);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .code-preview {
+      background: #050811;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      padding: 1rem;
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      color: #cbd5e1;
+      overflow-x: auto;
+      position: relative;
+    }
+    .code-preview pre { margin: 0; }
+    .btn-copy-code {
+      position: absolute;
+      top: 0.6rem;
+      right: 0.6rem;
+    }
+
+    /* Modals */
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 1rem;
+    }
+    .modal-overlay.active { display: flex; }
+    .modal-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-light);
+      border-radius: var(--radius-lg);
+      width: 100%;
+      max-width: 540px;
+      padding: 1.75rem;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.7);
+      animation: modalFadeIn 0.2s ease;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    @keyframes modalFadeIn {
+      from { opacity: 0; transform: scale(0.96); }
+      to { opacity: 1; transform: scale(1); }
+    }
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1.25rem;
+    }
+    .modal-title { font-size: 1.15rem; font-weight: 700; }
+    .modal-close {
+      background: transparent;
+      border: none;
+      font-size: 1.4rem;
+      color: var(--text-dim);
+      cursor: pointer;
+    }
+    .modal-close:hover { color: var(--text-main); }
+    .form-group {
+      margin-bottom: 1rem;
+    }
+    .form-label {
+      display: block;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 0.35rem;
+    }
+    .form-input, .form-textarea, .form-select {
+      width: 100%;
+      background: var(--bg-dark);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      color: var(--text-main);
+      padding: 0.6rem 0.8rem;
+      font-size: 0.85rem;
+      font-family: inherit;
+    }
+    .form-input:focus, .form-textarea:focus, .form-select:focus {
+      outline: none;
+      border-color: var(--accent-cyan);
+    }
+    .form-textarea { font-family: var(--font-mono); resize: vertical; min-height: 90px; }
+    .alert {
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      border-radius: var(--radius-sm);
+      padding: 0.75rem;
+      font-size: 0.78rem;
+      color: #fbbf24;
+      line-height: 1.4;
+      margin-bottom: 1rem;
+    }
+
+    /* Toast Notification */
+    .toast-container {
+      position: fixed;
+      top: 1.5rem;
+      right: 1.5rem;
+      z-index: 2000;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+    .toast {
+      background: var(--bg-card);
+      border: 1px solid var(--border-light);
+      border-radius: var(--radius-sm);
+      padding: 0.75rem 1.25rem;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.6);
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      animation: toastIn 0.3s ease;
+      color: var(--text-main);
+    }
+    .toast-success { border-left: 4px solid var(--accent-green); }
+    .toast-error { border-left: 4px solid var(--accent-rose); }
+    @keyframes toastIn {
+      from { transform: translateX(100%); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+
+    /* Empty state */
+    .empty-placeholder {
+      grid-column: 1 / -1;
+      text-align: center;
+      padding: 3rem 1rem;
+      background: var(--bg-card);
+      border: 1px dashed var(--border-color);
+      border-radius: var(--radius-md);
+      color: var(--text-dim);
+    }
+    .empty-placeholder p { margin-top: 0.5rem; font-size: 0.85rem; }
+
+    /* Footer */
+    footer {
+      text-align: center;
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      margin-top: 3rem;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="toast-container" id="toastContainer"></div>
+
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <div class="brand">
+        <div class="brand-icon">⚡</div>
+        <div class="brand-text">
+          <h1>Gemini Hybrid Pool Gateway</h1>
+          <p>Dual-Channel Autonomous AI Cluster | لوحة التحكم والمراقبة</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <div class="toggle-wrapper">
+          <label class="switch">
+            <input type="checkbox" id="autoRefreshToggle" checked>
+            <span class="slider"></span>
+          </label>
+          <span>Auto-refresh (3s)</span>
+        </div>
+        <button class="btn btn-outline" id="btnSyncQuotas" onclick="syncQuotasNow()">
+          <span>🔄 Sync Quotas Now</span>
+        </button>
+        <button class="btn btn-primary" onclick="openOAuthModal()">
+          <span>+ Add OAuth Account</span>
+        </button>
+        <button class="btn btn-success" onclick="openWebModal()">
+          <span>+ Add Web Account</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Top KPI Grid -->
+    <div class="kpi-grid">
+      <div class="kpi-card status-healthy" id="cardPoolHealth">
+        <div class="kpi-title">Pool Status</div>
+        <div class="kpi-value" id="kpiPoolStatus">HEALTHY</div>
+        <div class="kpi-subtitle" id="kpiAccountsSummary">Active Pool Nodes</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">Active Accounts</div>
+        <div class="kpi-value" id="kpiActiveAccounts">0 / 0</div>
+        <div class="kpi-subtitle">OAuth & Web accounts ready</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">In-Flight Concurrency</div>
+        <div class="kpi-value" id="kpiTotalConcurrency">0</div>
+        <div class="kpi-subtitle">Active requests ($C_{\text{total}}$)</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-title">Supported Models</div>
+        <div class="kpi-value" id="kpiModelsCount">0</div>
+        <div class="kpi-subtitle">Discovered across cluster</div>
+      </div>
+    </div>
+
+    <!-- Quick Agent Connect Card -->
+    <div class="agent-connect-card">
+      <div class="agent-connect-header">
+        <h3>🚀 Quick Agent Connect (Pi & Hermes)</h3>
+        <span class="badge badge-active"><span class="badge-dot"></span> OpenAI-Compatible Gateway</span>
+      </div>
+      <p style="font-size: 0.84rem; color: var(--text-muted); margin-bottom: 1rem;">
+        Integrate local agent workflows seamlessly using standard OpenAI client configuration.
+      </p>
+      <div class="connect-row">
+        <div class="connect-input-box">
+          <div>
+            <div class="connect-label">Base URL</div>
+            <div class="connect-value" id="valBaseUrl">http://localhost:8000/v1</div>
+          </div>
+          <button class="btn btn-outline btn-sm" onclick="copyText('http://localhost:8000/v1', 'Base URL copied')">Copy</button>
+        </div>
+        <div class="connect-input-box">
+          <div>
+            <div class="connect-label">API Key</div>
+            <div class="connect-value" id="valApiKey">sk-gemini-hybrid-pool</div>
+          </div>
+          <button class="btn btn-outline btn-sm" onclick="copyText('sk-gemini-hybrid-pool', 'API Key copied')">Copy</button>
+        </div>
+      </div>
+      <div class="code-preview">
+        <button class="btn btn-outline btn-sm btn-copy-code" onclick="copyAgentJson()">Copy JSON</button>
+        <pre><code id="agentJsonSnippet">{
+  "provider": "openai-compatible",
+  "base_url": "http://localhost:8000/v1",
+  "api_key": "sk-gemini-hybrid-pool",
+  "main_agent_model": "gemini-4-argon",
+  "sub_agent_model": "gemini-3.8-flash",
+  "fallback_model": "gemini-3.1-flash-lite",
+  "max_parallel_sub_agents": 8
+}</code></pre>
+      </div>
+    </div>
+
+    <!-- Section 1: OAuth CLI Accounts -->
+    <div class="section-header">
+      <div class="section-title">
+        <span>🔑 OAuth CLI Accounts (CloudCode Channel)</span>
+        <span class="count" id="countOAuth">0</span>
+      </div>
+    </div>
+    <div class="pool-grid" id="gridOAuthAccounts">
+      <div class="empty-placeholder">
+        <h3>No OAuth Accounts Registered</h3>
+        <p>Click "+ Add OAuth Account" to authorize an Antigravity CLI account.</p>
+      </div>
+    </div>
+
+    <!-- Section 2: Web Cookie Accounts -->
+    <div class="section-header">
+      <div class="section-title">
+        <span>🌐 Web Cookie Accounts (Google AI Pro Channel)</span>
+        <span class="count" id="countWeb">0</span>
+      </div>
+    </div>
+    <div class="pool-grid" id="gridWebAccounts">
+      <div class="empty-placeholder">
+        <h3>No Web Accounts Registered</h3>
+        <p>Click "+ Add Web Account" to link a Firefox profile or paste session cookies.</p>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer>
+      Gemini-Hybrid-Pool-Gateway &bull; Dynamic Telemetry & Mathematical Control Plane
+    </footer>
+  </div>
+
+  <!-- Modal: Add OAuth Account -->
+  <div class="modal-overlay" id="modalOAuth">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">Authorize OAuth CLI Account</div>
+        <button class="modal-close" onclick="closeOAuthModal()">&times;</button>
+      </div>
+      <div id="oauthStep1">
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
+          Step 1: Generate a secure PKCE authorization URL and sign in with your Google Account.
+        </p>
+        <div class="form-group">
+          <label class="form-label">Redirect URI</label>
+          <input type="text" class="form-input" id="oauthRedirectUri" value="http://localhost:8000/oauth/callback" />
+        </div>
+        <button class="btn btn-primary" style="width: 100%; margin-top: 0.5rem;" onclick="generateOAuthUrl()">
+          <span>Generate Auth URL & Open Consent Screen</span>
+        </button>
+      </div>
+
+      <div id="oauthStep2" style="display: none; margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border-color);">
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
+          Step 2: Paste the authorization code or full callback URL returned by Google.
+        </p>
+        <div class="form-group">
+          <label class="form-label">Authorization Code or Callback URL *</label>
+          <textarea class="form-textarea" id="oauthCodeInput" placeholder="4/0AWtg... or http://localhost:8000/oauth/callback?code=..."></textarea>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Account ID (Optional, auto-generated if blank)</label>
+          <input type="text" class="form-input" id="oauthAccountId" placeholder="e.g. oauth-pro-1" />
+        </div>
+        <div class="form-group">
+          <label class="form-label">Account Label</label>
+          <input type="text" class="form-input" id="oauthAccountLabel" placeholder="e.g. Primary Dev Account" />
+        </div>
+        <div class="form-group">
+          <label class="form-label">Max Concurrency ($C_{\text{max}}$)</label>
+          <input type="number" class="form-input" id="oauthConcurrency" value="3" min="1" max="10" />
+        </div>
+        <button class="btn btn-success" style="width: 100%;" onclick="completeOAuthSubmission()">
+          <span>Complete Authorization & Save</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Add Web Account -->
+  <div class="modal-overlay" id="modalWeb">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">Add Web Cookie Account</div>
+        <button class="modal-close" onclick="closeWebModal()">&times;</button>
+      </div>
+      <div class="alert">
+        ⚠️ <strong>Hygiene Notice:</strong> Disable "Saved Info" at
+        <a href="https://gemini.google.com/saved-info" target="_blank" style="color: #38bdf8;">gemini.google.com/saved-info</a>
+        before adding. If pasting cookies from Private/Incognito, close the private tab immediately without signing out.
+      </div>
+      <div class="form-group">
+        <label class="form-label">Account ID *</label>
+        <input type="text" class="form-input" id="webAccountId" placeholder="e.g. web-account-1" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Account Label</label>
+        <input type="text" class="form-input" id="webAccountLabel" placeholder="e.g. Secondary Pro Account" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Cookie Input Method</label>
+        <select class="form-select" id="webInputMethod" onchange="toggleWebInputFields()">
+          <option value="paste">Paste Cookies String / JSON</option>
+          <option value="firefox">Firefox Profile Path</option>
+          <option value="tokens">Direct __Secure-1PSID / 1PSIDTS</option>
+        </select>
+      </div>
+      <div class="form-group" id="fieldWebCookies">
+        <label class="form-label">Raw Cookie Header or JSON</label>
+        <textarea class="form-textarea" id="webCookiesText" placeholder="Cookie: __Secure-1PSID=...; __Secure-1PSIDTS=..."></textarea>
+      </div>
+      <div class="form-group" id="fieldWebFirefox" style="display: none;">
+        <label class="form-label">Firefox Profile Directory / cookies.sqlite</label>
+        <input type="text" class="form-input" id="webFirefoxPath" placeholder="C:\Users\...\AppData\Roaming\Mozilla\Firefox\Profiles\xyz.default-release" />
+      </div>
+      <div id="fieldWebTokens" style="display: none;">
+        <div class="form-group">
+          <label class="form-label">__Secure-1PSID *</label>
+          <input type="text" class="form-input" id="webPsid" placeholder="g.a000..." />
+        </div>
+        <div class="form-group">
+          <label class="form-label">__Secure-1PSIDTS (Optional)</label>
+          <input type="text" class="form-input" id="webPsidts" placeholder="sidts-..." />
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Max Concurrency ($C_{\text{max}}$)</label>
+        <input type="number" class="form-input" id="webConcurrency" value="2" min="1" max="8" />
+      </div>
+      <button class="btn btn-success" style="width: 100%; margin-top: 0.5rem;" onclick="submitWebAccount()">
+        <span>Register Web Account</span>
+      </button>
+    </div>
+  </div>
+
+  <script>
+    // State management
+    let currentOAuthSession = null;
+    let refreshIntervalId = null;
+
+    // Toast notifications
+    function showToast(message, type = "success") {
+      const container = document.getElementById("toastContainer");
+      const toast = document.createElement("div");
+      toast.className = `toast toast-${type}`;
+      toast.innerHTML = `<span>${type === 'success' ? '✓' : '⚠️'}</span><span>${message}</span>`;
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.style.opacity = "0";
+        setTimeout(() => toast.remove(), 300);
+      }, 4000);
+    }
+
+    function copyText(text, successMsg) {
+      navigator.clipboard.writeText(text).then(() => {
+        showToast(successMsg || "Copied to clipboard!");
+      });
+    }
+
+    function copyAgentJson() {
+      const snippet = document.getElementById("agentJsonSnippet").innerText;
+      copyText(snippet, "Pi & Hermes config copied!");
+    }
+
+    // Modal controls
+    function openOAuthModal() {
+      document.getElementById("modalOAuth").classList.add("active");
+      document.getElementById("oauthStep1").style.display = "block";
+      document.getElementById("oauthStep2").style.display = "none";
+    }
+    function closeOAuthModal() {
+      document.getElementById("modalOAuth").classList.remove("active");
+    }
+    function openWebModal() {
+      document.getElementById("modalWeb").classList.add("active");
+    }
+    function closeWebModal() {
+      document.getElementById("modalWeb").classList.remove("active");
+    }
+
+    function toggleWebInputFields() {
+      const method = document.getElementById("webInputMethod").value;
+      document.getElementById("fieldWebCookies").style.display = method === "paste" ? "block" : "none";
+      document.getElementById("fieldWebFirefox").style.display = method === "firefox" ? "block" : "none";
+      document.getElementById("fieldWebTokens").style.display = method === "tokens" ? "block" : "none";
+    }
+
+    // API calls
+    async function fetchGatewayStatus() {
+      try {
+        const resp = await fetch("/api/status");
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        renderDashboard(data);
+      } catch (err) {
+        console.warn("Failed to fetch gateway telemetry:", err);
+      }
+    }
+
+    async function syncQuotasNow() {
+      const btn = document.getElementById("btnSyncQuotas");
+      btn.disabled = true;
+      btn.innerHTML = "<span>⏳ Syncing...</span>";
+      try {
+        const resp = await fetch("/api/accounts/sync-quotas", { method: "POST" });
+        const data = await resp.json();
+        showToast("Quotas synchronized across all accounts!");
+        await fetchGatewayStatus();
+      } catch (err) {
+        showToast(`Sync failed: ${err.message}`, "error");
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = "<span>🔄 Sync Quotas Now</span>";
+      }
+    }
+
+    async function generateOAuthUrl() {
+      const redirectUri = document.getElementById("oauthRedirectUri").value.trim();
+      try {
+        const resp = await fetch("/api/oauth-accounts/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ redirect_uri: redirectUri }),
+        });
+        if (!resp.ok) throw new Error(await resp.text());
+        const data = await resp.json();
+        currentOAuthSession = data;
+        window.open(data.auth_url, "_blank");
+        document.getElementById("oauthStep2").style.display = "block";
+        showToast("Authorization URL opened in new tab!");
+      } catch (err) {
+        showToast(`Init failed: ${err.message}`, "error");
+      }
+    }
+
+    async function completeOAuthSubmission() {
+      const code = document.getElementById("oauthCodeInput").value.trim();
+      if (!code) {
+        showToast("Please enter the authorization code or URL.", "error");
+        return;
+      }
+      const accountId = document.getElementById("oauthAccountId").value.trim();
+      const label = document.getElementById("oauthAccountLabel").value.trim();
+      const concurrency = parseInt(document.getElementById("oauthConcurrency").value, 10) || 3;
+
+      const payload = {
+        code: code,
+        account_id: accountId || null,
+        label: label,
+        max_concurrency: concurrency,
+        state: currentOAuthSession ? currentOAuthSession.state : null,
+        code_verifier: currentOAuthSession ? currentOAuthSession.code_verifier : null,
+        redirect_uri: currentOAuthSession ? currentOAuthSession.redirect_uri : null,
+      };
+
+      try {
+        const resp = await fetch("/api/oauth-accounts/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({ detail: "Request failed" }));
+          throw new Error(errData.detail || "Completion failed");
+        }
+        showToast("OAuth account authorized and linked successfully!");
+        closeOAuthModal();
+        await fetchGatewayStatus();
+      } catch (err) {
+        showToast(`OAuth failed: ${err.message}`, "error");
+      }
+    }
+
+    async function submitWebAccount() {
+      const accountId = document.getElementById("webAccountId").value.trim();
+      if (!accountId) {
+        showToast("Account ID is required.", "error");
+        return;
+      }
+      const label = document.getElementById("webAccountLabel").value.trim();
+      const concurrency = parseInt(document.getElementById("webConcurrency").value, 10) || 2;
+      const method = document.getElementById("webInputMethod").value;
+
+      const payload = {
+        account_id: accountId,
+        label: label,
+        max_concurrency: concurrency,
+      };
+
+      if (method === "paste") {
+        payload.cookies = document.getElementById("webCookiesText").value.trim();
+      } else if (method === "firefox") {
+        payload.firefox_profile_path = document.getElementById("webFirefoxPath").value.trim();
+      } else if (method === "tokens") {
+        payload.secure_1psid = document.getElementById("webPsid").value.trim();
+        payload.secure_1psidts = document.getElementById("webPsidts").value.trim();
+      }
+
+      try {
+        const resp = await fetch("/api/web-accounts/add", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({ detail: "Request failed" }));
+          throw new Error(errData.detail || "Registration failed");
+        }
+        showToast("Web account linked and cookies isolated!");
+        closeWebModal();
+        await fetchGatewayStatus();
+      } catch (err) {
+        showToast(`Registration error: ${err.message}`, "error");
+      }
+    }
+
+    async function deleteAccount(type, accountId) {
+      if (!confirm(`Are you sure you want to delete ${type} account '${accountId}'?`)) return;
+      const endpoint = type === 'oauth'
+        ? `/api/oauth-accounts/${encodeURIComponent(accountId)}`
+        : `/api/web-accounts/${encodeURIComponent(accountId)}`;
+      try {
+        const resp = await fetch(endpoint, { method: "DELETE" });
+        if (!resp.ok) throw new Error(await resp.text());
+        showToast(`Account '${accountId}' removed.`);
+        await fetchGatewayStatus();
+      } catch (err) {
+        showToast(`Delete failed: ${err.message}`, "error");
+      }
+    }
+
+    // Render logic
+    function renderDashboard(data) {
+      // 1. KPIs
+      const poolStatus = data.pool_status || "UNKNOWN";
+      const cardPool = document.getElementById("cardPoolHealth");
+      cardPool.className = "kpi-card";
+      if (poolStatus === "HEALTHY") cardPool.classList.add("status-healthy");
+      else if (poolStatus === "DEGRADED") cardPool.classList.add("status-degraded");
+      else cardPool.classList.add("status-empty");
+
+      document.getElementById("kpiPoolStatus").textContent = poolStatus;
+      document.getElementById("kpiActiveAccounts").textContent = `${data.general_stats.active_accounts} / ${data.general_stats.total_accounts}`;
+      document.getElementById("kpiTotalConcurrency").textContent = data.general_stats.total_concurrency;
+      document.getElementById("kpiModelsCount").textContent = data.available_models ? data.available_models.length : 0;
+      document.getElementById("countOAuth").textContent = data.oauth_accounts.length;
+      document.getElementById("countWeb").textContent = data.web_accounts.length;
+
+      // 2. Render OAuth Accounts
+      const oauthContainer = document.getElementById("gridOAuthAccounts");
+      if (!data.oauth_accounts || data.oauth_accounts.length === 0) {
+        oauthContainer.innerHTML = `
+          <div class="empty-placeholder">
+            <h3>No OAuth Accounts Registered</h3>
+            <p>Click "+ Add OAuth Account" to link your Antigravity CLI account.</p>
+          </div>`;
+      } else {
+        oauthContainer.innerHTML = data.oauth_accounts.map(acc => {
+          const statusClass = acc.status === "ACTIVE" ? "badge-active" : (acc.status === "COOLDOWN" ? "badge-cooldown" : "badge-suspended");
+          const quotasEntries = Object.entries(acc.model_quotas || {});
+          const quotasHtml = quotasEntries.map(([mName, q]) => {
+            const pct = Math.round(q.remaining_fraction * 100);
+            const fillClass = pct > 40 ? "fill-green" : (pct > 15 ? "fill-amber" : "fill-rose");
+            return `
+              <div class="progress-bar-wrapper">
+                <div class="progress-header">
+                  <span class="progress-title">${mName}</span>
+                  <span class="progress-pct">${pct}% left</span>
+                </div>
+                <div class="progress-track">
+                  <div class="progress-fill ${fillClass}" style="width: ${pct}%;"></div>
+                </div>
+              </div>`;
+          }).join("");
+
+          return `
+            <div class="account-card">
+              <div class="account-card-header">
+                <div>
+                  <div class="account-id">${acc.id}</div>
+                  <div class="account-label">${acc.label || 'No label'}</div>
+                </div>
+                <span class="badge ${statusClass}"><span class="badge-dot"></span> ${acc.status}</span>
+              </div>
+              <div class="account-metrics-row">
+                <div>
+                  <div class="metric-item-label">Concurrency (C)</div>
+                  <div class="metric-item-value">${acc.active_requests} / ${acc.max_concurrency}</div>
+                </div>
+                <div>
+                  <div class="metric-item-label">Priority (P)</div>
+                  <div class="metric-item-value">${acc.priority_score.toFixed(3)}</div>
+                </div>
+                <div>
+                  <div class="metric-item-label">Latency (L)</div>
+                  <div class="metric-item-value">${acc.recent_latency_ms} ms</div>
+                </div>
+              </div>
+              <div class="quota-group">
+                <div style="font-size: 0.72rem; text-transform: uppercase; color: var(--text-dim); margin-bottom: 0.2rem;">Model Quotas</div>
+                ${quotasHtml || '<div style="font-size: 0.75rem; color: var(--text-dim);">No quotas recorded</div>'}
+              </div>
+              <div style="display: flex; justify-content: flex-end; margin-top: auto; padding-top: 0.5rem; border-top: 1px solid var(--border-color);">
+                <button class="btn btn-danger btn-sm" onclick="deleteAccount('oauth', '${acc.id}')">Delete</button>
+              </div>
+            </div>`;
+        }).join("");
+      }
+
+      // 3. Render Web Accounts
+      const webContainer = document.getElementById("gridWebAccounts");
+      if (!data.web_accounts || data.web_accounts.length === 0) {
+        webContainer.innerHTML = `
+          <div class="empty-placeholder">
+            <h3>No Web Accounts Registered</h3>
+            <p>Click "+ Add Web Account" to link a Firefox profile or paste session cookies.</p>
+          </div>`;
+      } else {
+        webContainer.innerHTML = data.web_accounts.map(acc => {
+          const statusClass = acc.status === "ACTIVE" ? "badge-active" : (acc.status === "COOLDOWN" ? "badge-cooldown" : "badge-suspended");
+          const u5 = Math.round(acc.usage.effective_5h_pct * 100);
+          const uw = Math.round(acc.usage.effective_weekly_pct * 100);
+          const fillClass5 = u5 < 60 ? "fill-green" : (u5 < 85 ? "fill-amber" : "fill-rose");
+          const fillClassW = uw < 60 ? "fill-green" : (uw < 85 ? "fill-amber" : "fill-rose");
+
+          return `
+            <div class="account-card">
+              <div class="account-card-header">
+                <div>
+                  <div class="account-id">${acc.id}</div>
+                  <div class="account-label">${acc.label || 'No label'} &bull; <span class="badge badge-tier">${acc.tier}</span></div>
+                </div>
+                <span class="badge ${statusClass}"><span class="badge-dot"></span> ${acc.status}</span>
+              </div>
+              <div class="account-metrics-row">
+                <div>
+                  <div class="metric-item-label">Concurrency (C)</div>
+                  <div class="metric-item-value">${acc.active_requests} / ${acc.max_concurrency}</div>
+                </div>
+                <div>
+                  <div class="metric-item-label">Priority (P)</div>
+                  <div class="metric-item-value">${acc.priority_score.toFixed(3)}</div>
+                </div>
+                <div>
+                  <div class="metric-item-label">Urgency (&tau;)</div>
+                  <div class="metric-item-value">${acc.dynamic_metrics.tau}</div>
+                </div>
+              </div>
+              <div class="quota-group">
+                <div class="progress-bar-wrapper">
+                  <div class="progress-header">
+                    <span class="progress-title">5-Hour Usage Window</span>
+                    <span class="progress-pct">${u5}%</span>
+                  </div>
+                  <div class="progress-track">
+                    <div class="progress-fill ${fillClass5}" style="width: ${u5}%;"></div>
+                  </div>
+                </div>
+                <div class="progress-bar-wrapper">
+                  <div class="progress-header">
+                    <span class="progress-title">Weekly Usage Window</span>
+                    <span class="progress-pct">${uw}%</span>
+                  </div>
+                  <div class="progress-track">
+                    <div class="progress-fill ${fillClassW}" style="width: ${uw}%;"></div>
+                  </div>
+                </div>
+              </div>
+              <div style="display: flex; justify-content: flex-end; margin-top: auto; padding-top: 0.5rem; border-top: 1px solid var(--border-color);">
+                <button class="btn btn-danger btn-sm" onclick="deleteAccount('web', '${acc.id}')">Delete</button>
+              </div>
+            </div>`;
+        }).join("");
+      }
+    }
+
+    // Auto-refresh lifecycle
+    function initAutoRefresh() {
+      const toggle = document.getElementById("autoRefreshToggle");
+      function updateInterval() {
+        if (toggle.checked) {
+          if (!refreshIntervalId) {
+            refreshIntervalId = setInterval(fetchGatewayStatus, 3000);
+          }
+        } else {
+          if (refreshIntervalId) {
+            clearInterval(refreshIntervalId);
+            refreshIntervalId = null;
+          }
+        }
+      }
+      toggle.addEventListener("change", updateInterval);
+      updateInterval();
+    }
+
+    // Init
+    document.addEventListener("DOMContentLoaded", () => {
+      fetchGatewayStatus();
+      initAutoRefresh();
+    });
+  </script>
+</body>
+</html>

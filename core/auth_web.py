@@ -880,5 +880,16 @@ class WebSessionManager:
             await save_accounts_snapshot()
         return saved_paths
 
+    async def cleanup_expired_chats(self, max_idle_seconds: float = 3600.0) -> int:
+        """Purge idle Web chat sessions from LMDB and clean up orphaned temp history files."""
+        from core.prefix_differ import (
+            cleanup_expired_chats as _cleanup_chats,
+            cleanup_orphaned_temp_files as _cleanup_temp,
+        )
+
+        deleted = await _cleanup_chats(self.get_client, max_idle_seconds=max_idle_seconds)
+        _cleanup_temp()
+        return deleted
+
 
 web_session_manager = WebSessionManager()

@@ -1,0 +1,504 @@
+"""Main application entrypoint and CLI engine for Gemini-Hybrid-Pool-Gateway.
+
+Provides:
+1. Production FastAPI application factory (create_app) with Lifespan lifecycle management:
+   - Registers OpenAI protocol router at /v1.
+   - Registers Dashboard control-plane router at /api.
+   - Mounts static asset directory at /static.
+   - Serves dashboard UI at / and /dashboard via FileResponse.
+   - Configures permissive CORS middleware.
+   - Background AsyncIOScheduler for periodic quota sync (5m), cookie flushing (5m),
+     and idle chat/temp file cleanup (10m).
+2. Robust Click CLI engine:
+   - serve: Start the uvicorn ASGI server with configurable host, port, and reload.
+   - list-accounts: Pretty table of registered OAuth and Web accounts and quotas.
+   - sync-quotas: Immediate quota synchronization pass across all accounts.
+   - status / health: Quick telemetry overview of pool health and available models.
+   - add-oauth: Interactive Google OAuth PKCE authorization wizard.
+   - add-web: Interactive Web Cookie account registration from Firefox or manual cookies.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+import logging
+from pathlib import Path
+import re
+import secrets
+import time
+from typing import AsyncIterator
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import click
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+import uvicorn
+
+from api.dashboard_routes import router as dashboard_router
+from api.openai_routes import router as openai_router
+from config.settings import (
+    BASE_DIR,
+    OAuthAccount,
+    OAuthCredentials,
+    WebAccount,
+    load_accounts_into_memory,
+    save_accounts_snapshot,
+    state_registry,
+)
+from core.auth_oauth_cli import (
+    build_authorization_url,
+    complete_oauth_login,
+    extract_code_from_manual_input,
+    generate_pkce_pair,
+)
+from core.auth_web import (
+    extract_firefox_cookies,
+    get_account_cookie_cache_path,
+    get_saved_info_hygiene_notice,
+    parse_cookie_header_or_dict,
+    parse_manual_cookies,
+    save_account_cookies_isolated,
+    web_session_manager,
+)
+from core.hybrid_scheduler import (
+    calculate_oauth_account_score,
+    calculate_web_account_score,
+)
+from core.model_registry import discover_oauth_models, unified_model_registry
+from core.prefix_differ import cleanup_orphaned_temp_files
+from core.usage_monitor import sync_all_registered_accounts
+
+logger = logging.getLogger(__name__)
+
+STATIC_DIR: Path = BASE_DIR / "static"
+INDEX_HTML_PATH: Path = STATIC_DIR / "index.html"
+_SAFE_ACCOUNT_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
+
+
+# ============================================================================
+# 1. Lifespan & Application Factory
+# ============================================================================
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Manage application startup initialization and graceful shutdown cleanup."""
+    logger.info("Initializing Gemini Hybrid Pool Gateway...")
+
+    load_accounts_into_memory()
+    cleanup_orphaned_temp_files()
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        sync_all_registered_accounts,
+        "interval",
+        minutes=5,
+        args=[state_registry],
+        id="sync_quotas",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        web_session_manager.flush_all_cookies,
+        "interval",
+        minutes=5,
+        id="flush_cookies",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        web_session_manager.cleanup_expired_chats,
+        "interval",
+        minutes=10,
+        kwargs={"max_idle_seconds": 3600.0},
+        id="cleanup_chats",
+        replace_existing=True,
+    )
+    scheduler.start()
+    app.state.scheduler = scheduler
+    logger.info("Background tasks scheduler started successfully.")
+
+    try:
+        yield
+    finally:
+        logger.info("Initiating graceful shutdown sequence...")
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception as exc:
+            logger.warning("Error stopping background scheduler: %s", exc)
+
+        try:
+            await web_session_manager.flush_all_cookies()
+        except Exception as exc:
+            logger.warning("Error flushing cookies on shutdown: %s", exc)
+
+        try:
+            await save_accounts_snapshot()
+        except Exception as exc:
+            logger.warning("Error persisting accounts snapshot on shutdown: %s", exc)
+
+        logger.info("Shutdown sequence completed.")
+
+
+def create_app() -> FastAPI:
+    """Instantiate and configure the FastAPI production application."""
+    application = FastAPI(
+        title="Gemini Hybrid Pool Gateway",
+        lifespan=lifespan,
+    )
+
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    application.include_router(openai_router)
+    application.include_router(dashboard_router)
+
+    if not STATIC_DIR.exists():
+        STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    application.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @application.get("/", include_in_schema=False)
+    @application.get("/dashboard", include_in_schema=False)
+    async def serve_dashboard() -> FileResponse:
+        """Serve the dashboard web client."""
+        if INDEX_HTML_PATH.exists():
+            return FileResponse(str(INDEX_HTML_PATH))
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dashboard UI not found. Ensure static/index.html exists.",
+        )
+
+    return application
+
+
+app: FastAPI = create_app()
+
+
+# ============================================================================
+# 2. CLI Presentation Helpers
+# ============================================================================
+
+
+def _format_quotas_summary(account: OAuthAccount | WebAccount) -> str:
+    """Format account quota buckets for tabular CLI display."""
+    if isinstance(account, OAuthAccount):
+        model_quotas = getattr(account.quota_state, "model_quotas", {})
+        if not model_quotas:
+            return "No quotas synced"
+        items = [
+            f"{model}: {int(round(quota.remaining_fraction * 100))}%"
+            for model, quota in sorted(model_quotas.items())
+        ]
+        return ", ".join(items)
+
+    pct_5h = round(account.usage.five_hour_pct * 100, 1)
+    pct_weekly = round(account.usage.weekly_pct * 100, 1)
+    return f"5h: {pct_5h}%, weekly: {pct_weekly}%"
+
+
+def _format_account_score(account: OAuthAccount | WebAccount, now: float) -> str:
+    """Compute and format priority score for CLI display."""
+    try:
+        if isinstance(account, OAuthAccount):
+            model = account.discovered_models[0] if account.discovered_models else "gemini-3.8-flash"
+            score = calculate_oauth_account_score(account, model, now=now)
+        else:
+            score = calculate_web_account_score(account, "gemini-4-argon", now=now)
+        return f"{score:.4f}"
+    except Exception:
+        return f"{account.priority:.2f}"
+
+
+def ensure_accounts_loaded() -> None:
+    """Ensure accounts are loaded into memory if not already present."""
+    if not state_registry.oauth_accounts and not state_registry.web_accounts:
+        load_accounts_into_memory()
+
+
+def build_accounts_table() -> str:
+    """Build a formatted table of all registered OAuth and Web accounts."""
+    ensure_accounts_loaded()
+    oauth_accs = state_registry.oauth_accounts
+    web_accs = state_registry.web_accounts
+    if not oauth_accs and not web_accs:
+        return "No accounts registered. Use 'add-oauth' or 'add-web' to register accounts."
+
+    now = time.time()
+    rows: list[tuple[str, str, str, str, str]] = []
+    for acc in oauth_accs:
+        rows.append(
+            (acc.id, "oauth", acc.status, _format_account_score(acc, now), _format_quotas_summary(acc))
+        )
+    for acc in web_accs:
+        rows.append(
+            (acc.id, "web", acc.status, _format_account_score(acc, now), _format_quotas_summary(acc))
+        )
+
+    headers = ("ID", "Channel", "Status", "Priority", "Quotas")
+    col_widths = [max(len(h), max(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+
+    sep_line = "+" + "+".join("-" * (w + 2) for w in col_widths) + "+"
+    header_line = "| " + " | ".join(f"{h:<{w}}" for h, w in zip(headers, col_widths)) + " |"
+
+    lines = [sep_line, header_line, sep_line]
+    for row in rows:
+        lines.append("| " + " | ".join(f"{col:<{w}}" for col, w in zip(row, col_widths)) + " |")
+    lines.append(sep_line)
+    return "\n".join(lines)
+
+
+def build_status_summary() -> str:
+    """Compile pool status, account breakdown, and available models."""
+    ensure_accounts_loaded()
+    oauth_accs = state_registry.oauth_accounts
+    web_accs = state_registry.web_accounts
+    all_accs = list(oauth_accs) + list(web_accs)
+    total = len(all_accs)
+    active = sum(1 for a in all_accs if a.status == "ACTIVE")
+    cooldown = sum(1 for a in all_accs if a.status == "COOLDOWN")
+    suspended = sum(1 for a in all_accs if a.status == "SUSPENDED")
+    concurrency = sum(a.active_requests for a in all_accs)
+
+    if total == 0:
+        pool_health = "EMPTY"
+    elif active == 0:
+        pool_health = "EXHAUSTED"
+    elif cooldown > 0 or suspended > 0:
+        pool_health = "DEGRADED"
+    else:
+        pool_health = "HEALTHY"
+
+    models = unified_model_registry.get_base_models()
+    models_str = ", ".join(models) if models else "No models registered"
+
+    return "\n".join(
+        [
+            "=" * 60,
+            "              Gemini Hybrid Pool Gateway Status             ",
+            "=" * 60,
+            f"Pool Health:        {pool_health}",
+            f"Total Accounts:     {total}",
+            f"  - Active:         {active}",
+            f"  - Cooldown:       {cooldown}",
+            f"  - Suspended:      {suspended}",
+            "Channel Breakdown:",
+            f"  - OAuth (CLI):    {len(oauth_accs)}",
+            f"  - Web (Cookies):  {len(web_accs)}",
+            f"Active Concurrency: {concurrency}",
+            f"Available Models ({len(models)}):",
+            f"  {models_str}",
+            "=" * 60,
+        ]
+    )
+
+
+# ============================================================================
+# 3. CLI Commands
+# ============================================================================
+
+
+@click.command(name="serve", help="Start the Gemini Hybrid Pool Gateway server.")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Host network interface to bind to.")
+@click.option("--port", default=8000, show_default=True, type=int, help="Port to bind to.")
+@click.option("--reload", is_flag=True, default=False, help="Enable automatic code reload.")
+def serve(host: str, port: int, reload: bool) -> None:
+    """Run the Uvicorn ASGI server."""
+    click.echo(f"Starting Gemini Hybrid Pool Gateway on http://{host}:{port} (reload={reload})...")
+    uvicorn.run("main:app", host=host, port=port, reload=reload)
+
+
+@click.command(name="list-accounts", help="Print table of registered accounts and quotas.")
+def list_accounts() -> None:
+    """Print registered accounts table."""
+    click.echo(build_accounts_table())
+
+
+@click.command(name="sync-quotas", help="Execute immediate quota synchronization from CLI.")
+def sync_quotas() -> None:
+    """Run quota synchronization pass and print updated table."""
+    ensure_accounts_loaded()
+    click.echo("Syncing account quotas across pool...")
+    try:
+        asyncio.run(sync_all_registered_accounts(state_registry))
+        asyncio.run(save_accounts_snapshot())
+        click.secho("Quota synchronization completed successfully.", fg="green")
+        click.echo(build_accounts_table())
+    except Exception as exc:
+        logger.error("Error during quota sync: %s", exc)
+        raise click.ClickException(f"Quota sync failed: {exc}")
+
+
+@click.command(name="status", help="Check pool health, accounts, and available models.")
+def status_cmd() -> None:
+    """Display pool status."""
+    click.echo(build_status_summary())
+
+
+@click.command(name="health", help="Alias for 'status'.")
+@click.pass_context
+def health_cmd(ctx: click.Context) -> None:
+    """Display pool health (alias for status)."""
+    ctx.invoke(status_cmd)
+
+
+@click.command(name="add-oauth", help="Interactive wizard to link an OAuth CLI account.")
+@click.option("--id", "account_id", default=None, help="Unique identifier for the OAuth account.")
+def add_oauth(account_id: str | None) -> None:
+    """Interactive OAuth account registration."""
+    ensure_accounts_loaded()
+    if not account_id:
+        account_id = click.prompt("Enter Account ID", default=f"oauth-{secrets.token_hex(4)}")
+    account_id = account_id.strip()
+
+    if not _SAFE_ACCOUNT_ID_RE.match(account_id):
+        raise click.BadParameter("Account ID must be alphanumeric and safe for file paths.")
+
+    pkce = generate_pkce_pair()
+    redirect_uri = "http://localhost:8000/oauth/callback"
+    auth_url = build_authorization_url(redirect_uri=redirect_uri, pkce=pkce)
+
+    click.echo("\n--- Step 1: Authorize with Google ---")
+    click.echo("Open the following URL in your browser to authorize Gemini CLI:\n")
+    click.echo(auth_url)
+    click.echo("\n--- Step 2: Complete Authentication ---")
+    user_input = click.prompt("Paste the redirected URL or authorization code")
+
+    code = extract_code_from_manual_input(user_input, expected_state=pkce.state)
+
+    click.echo("\nExchanging code for tokens and discovering cloud project...")
+    try:
+        credentials = asyncio.run(
+            complete_oauth_login(
+                code=code,
+                redirect_uri=redirect_uri,
+                code_verifier=pkce.code_verifier,
+            )
+        )
+        account = OAuthAccount(
+            id=account_id,
+            credentials=credentials,
+            status="ACTIVE",
+        )
+        discovered = asyncio.run(discover_oauth_models(account))
+        account.discovered_models = discovered
+        state_registry.upsert_oauth_account(account)
+        asyncio.run(save_accounts_snapshot())
+
+        click.secho(
+            f"Successfully registered OAuth account '{account_id}' "
+            f"(Project: {credentials.project_id or 'unknown'}, "
+            f"Models: {len(discovered)})!",
+            fg="green",
+        )
+    except Exception as exc:
+        logger.error("OAuth registration failed: %s", exc)
+        raise click.ClickException(f"OAuth registration failed: {exc}")
+
+
+@click.command(name="add-web", help="Interactive wizard to add a Web Cookie account.")
+@click.option("--id", "account_id", default=None, help="Unique identifier for the Web account.")
+def add_web(account_id: str | None) -> None:
+    """Interactive Web account registration."""
+    ensure_accounts_loaded()
+    if not account_id:
+        account_id = click.prompt("Enter Account ID", default=f"web-{secrets.token_hex(4)}")
+    account_id = account_id.strip()
+
+    if not _SAFE_ACCOUNT_ID_RE.match(account_id):
+        raise click.BadParameter("Account ID must be alphanumeric and safe for file paths.")
+
+    click.echo("\nSelect cookie source:")
+    click.echo("  1. Firefox profile directory or cookies.sqlite file")
+    click.echo("  2. Manual cookie input (Cookie header, JSON, or __Secure-1PSID)")
+    choice = click.prompt("Choose option [1 or 2]", default="2", type=click.Choice(["1", "2"]))
+
+    try:
+        if choice == "1":
+            firefox_path = click.prompt("Enter Firefox cookies.sqlite or profile path")
+            parsed_cookies = extract_firefox_cookies(firefox_path.strip())
+        else:
+            cookie_input = click.prompt("Enter Cookie header, JSON, or __Secure-1PSID")
+            cleaned_input = cookie_input.strip()
+            if "__Secure-1PSID" in cleaned_input or ";" in cleaned_input or "{" in cleaned_input:
+                parsed_cookies = parse_cookie_header_or_dict(cleaned_input)
+            else:
+                psidts_input = click.prompt(
+                    "Enter __Secure-1PSIDTS (optional)",
+                    default="",
+                    show_default=False,
+                )
+                parsed_cookies = parse_manual_cookies(cleaned_input, psidts_input)
+
+        cookie_file_path = get_account_cookie_cache_path(account_id)
+        account = WebAccount(
+            id=account_id,
+            cookie_file=str(cookie_file_path),
+            cookies=parsed_cookies,
+            status="ACTIVE",
+            discovered_models=[
+                "gemini-4-argon",
+                "gemini-3.1-pro",
+                "gemini-3.8-flash",
+                "gemini-3.1-flash-lite",
+            ],
+        )
+
+        save_account_cookies_isolated(account, sync_snapshot=False)
+        state_registry.upsert_web_account(account)
+        asyncio.run(save_accounts_snapshot())
+
+        click.secho(f"Successfully registered Web account '{account_id}'!", fg="green")
+        click.echo("\n--- Hygiene Notice ---")
+        click.echo(get_saved_info_hygiene_notice())
+    except Exception as exc:
+        logger.error("Web account registration failed: %s", exc)
+        raise click.ClickException(f"Web account registration failed: {exc}")
+
+
+# ============================================================================
+# 4. Main CLI Group
+# ============================================================================
+
+
+@click.group(invoke_without_command=True)
+@click.option("--list-accounts", "flag_list_accounts", is_flag=True, help="List registered accounts.")
+@click.option("--sync-quotas", "flag_sync_quotas", is_flag=True, help="Sync account quotas immediately.")
+@click.option("--status", "flag_status", is_flag=True, help="Check pool health and status.")
+@click.pass_context
+def cli(
+    ctx: click.Context,
+    flag_list_accounts: bool,
+    flag_sync_quotas: bool,
+    flag_status: bool,
+) -> None:
+    """Gemini Hybrid Pool Gateway CLI & Management Interface."""
+    if flag_list_accounts:
+        ctx.invoke(list_accounts)
+        return
+    if flag_sync_quotas:
+        ctx.invoke(sync_quotas)
+        return
+    if flag_status:
+        ctx.invoke(status_cmd)
+        return
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(serve)
+
+
+cli.add_command(serve)
+cli.add_command(list_accounts)
+cli.add_command(sync_quotas)
+cli.add_command(status_cmd)
+cli.add_command(health_cmd)
+cli.add_command(add_oauth)
+cli.add_command(add_web)
+
+
+if __name__ == "__main__":
+    cli()

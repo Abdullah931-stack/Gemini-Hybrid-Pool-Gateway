@@ -71,3 +71,9 @@ config/cookies_cache/*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Agent Configurations & Directives
+.agents/
+.agent
+.egent
+

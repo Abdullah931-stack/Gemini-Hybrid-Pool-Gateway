@@ -247,17 +247,21 @@ def extract_quota_reset_delay_from_error(error_payload: Any) -> float | None:
         # httpx.HTTPStatusError or similar exception with attached response
         resp = error_payload.response
         # Check Retry-After header first
-        retry_header = resp.headers.get("retry-after") if hasattr(resp, "headers") else None
-        if retry_header:
+        retry_header = getattr(resp, "headers", {}).get("retry-after") if hasattr(resp, "headers") else None
+        if retry_header and isinstance(retry_header, str):
             parsed = parse_quota_reset_delay(retry_header)
             if parsed is not None:
                 return parsed
 
         try:
-            body = resp.json()
-            return extract_quota_reset_delay_from_error(body)
+            body = resp.json() if callable(getattr(resp, "json", None)) else None
+            if isinstance(body, (dict, list, str)):
+                return extract_quota_reset_delay_from_error(body)
         except Exception:
-            text = getattr(resp, "text", "")
+            pass
+
+        text = getattr(resp, "text", "")
+        if isinstance(text, str) and text:
             return extract_quota_reset_delay_from_error(text)
 
     return None

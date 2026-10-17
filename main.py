@@ -23,9 +23,11 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import logging
+import os
 from pathlib import Path
 import re
 import secrets
+import sys
 import time
 from typing import AsyncIterator
 
@@ -37,7 +39,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-from api.dashboard_routes import router as dashboard_router
+from api.dashboard_routes import callback_router, router as dashboard_router
 from api.openai_routes import router as openai_router
 from config.settings import (
     BASE_DIR,
@@ -49,12 +51,14 @@ from config.settings import (
     state_registry,
 )
 from core.auth_oauth_cli import (
+    OAuthCallbackServer,
     build_authorization_url,
     complete_oauth_login,
     extract_code_from_manual_input,
     generate_pkce_pair,
 )
 from core.auth_web import (
+    auto_discover_firefox_cookies,
     extract_firefox_cookies,
     get_account_cookie_cache_path,
     get_saved_info_hygiene_notice,
@@ -76,6 +80,14 @@ logger = logging.getLogger(__name__)
 STATIC_DIR: Path = BASE_DIR / "static"
 INDEX_HTML_PATH: Path = STATIC_DIR / "index.html"
 _SAFE_ACCOUNT_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
+
+
+def _is_interactive_terminal() -> bool:
+    """Return True if running in an interactive user terminal, False if headless or piped."""
+    try:
+        return sys.stdin.isatty() and os.getenv("DEBIAN_FRONTEND") != "noninteractive"
+    except Exception:
+        return False
 
 
 # ============================================================================
@@ -169,6 +181,7 @@ def create_app() -> FastAPI:
     )
 
     application.include_router(openai_router)
+    application.include_router(callback_router)
     application.include_router(dashboard_router)
 
     if not STATIC_DIR.exists():
@@ -361,11 +374,23 @@ def health_cmd(ctx: click.Context) -> None:
 
 @click.command(name="add-oauth", help="Interactive wizard to link an OAuth CLI account.")
 @click.option("--id", "account_id", default=None, help="Unique identifier for the OAuth account.")
-def add_oauth(account_id: str | None) -> None:
+@click.option("--label", default=None, help="Human-readable label for the OAuth account.")
+@click.option(
+    "--mode",
+    type=click.Choice(["http_v1internal", "agy_subprocess"]),
+    default="http_v1internal",
+    help="OAuth transport mode.",
+)
+def add_oauth(
+    account_id: str | None = None,
+    label: str | None = None,
+    mode: str = "http_v1internal",
+) -> None:
     """Interactive OAuth account registration."""
     ensure_accounts_loaded()
     if not account_id:
-        account_id = click.prompt("Enter Account ID", default=f"oauth-{secrets.token_hex(4)}")
+        default_id = f"oauth-{secrets.token_hex(4)}" if not label else label.lower().replace(" ", "-")
+        account_id = click.prompt("Enter Account ID", default=default_id)
     account_id = account_id.strip()
 
     if not _SAFE_ACCOUNT_ID_RE.match(account_id):
@@ -378,10 +403,42 @@ def add_oauth(account_id: str | None) -> None:
     click.echo("\n--- Step 1: Authorize with Google ---")
     click.echo("Open the following URL in your browser to authorize Gemini CLI:\n")
     click.echo(auth_url)
-    click.echo("\n--- Step 2: Complete Authentication ---")
-    user_input = click.prompt("Paste the redirected URL or authorization code")
 
-    code = extract_code_from_manual_input(user_input, expected_state=pkce.state)
+    is_interactive = _is_interactive_terminal()
+    code: str | None = None
+
+    if is_interactive:
+        click.echo("Opening Google authorization page in your browser...")
+        try:
+            import webbrowser
+            webbrowser.open(auth_url)
+        except Exception as exc:
+            logger.debug("Failed to auto-open browser: %s", exc)
+
+        click.echo("\n--- Step 2: Complete Authentication ---")
+        click.echo("Awaiting Google sign-in in your browser (press Ctrl+C to cancel)...")
+        try:
+            async def _listen_for_callback() -> str:
+                server = OAuthCallbackServer(
+                    host="127.0.0.1",
+                    port=8000,
+                    expected_state=pkce.state,
+                )
+                await server.start()
+                return await server.wait_for_code(timeout=180.0)
+
+            code = asyncio.run(_listen_for_callback())
+        except KeyboardInterrupt:
+            click.echo("\nCancelled browser callback wait. Switching to manual input.")
+        except Exception as exc:
+            logger.debug("Automatic callback listener not active or timed out: %s", exc)
+            click.echo(f"\nNotice: Automatic callback listener not active ({exc}). Switching to manual input.")
+
+    if not code:
+        if not is_interactive:
+            click.echo("\n--- Step 2: Complete Authentication ---")
+        user_input = click.prompt("Paste the redirected URL or authorization code")
+        code = extract_code_from_manual_input(user_input, expected_state=pkce.state)
 
     click.echo("\nExchanging code for tokens and discovering cloud project...")
     try:
@@ -394,6 +451,8 @@ def add_oauth(account_id: str | None) -> None:
         )
         account = OAuthAccount(
             id=account_id,
+            label=label or account_id,
+            transport_mode=mode,
             credentials=credentials,
             status="ACTIVE",
         )
@@ -415,41 +474,83 @@ def add_oauth(account_id: str | None) -> None:
 
 @click.command(name="add-web", help="Interactive wizard to add a Web Cookie account.")
 @click.option("--id", "account_id", default=None, help="Unique identifier for the Web account.")
-def add_web(account_id: str | None) -> None:
+@click.option("--label", default=None, help="Human-readable label for the Web account.")
+@click.option("--firefox-profile", default=None, help="Firefox profile name or cookies.sqlite path to import.")
+def add_web(
+    account_id: str | None = None,
+    label: str | None = None,
+    firefox_profile: str | None = None,
+) -> None:
     """Interactive Web account registration."""
     ensure_accounts_loaded()
     if not account_id:
-        account_id = click.prompt("Enter Account ID", default=f"web-{secrets.token_hex(4)}")
+        default_id = f"web-{secrets.token_hex(4)}" if not label else label.lower().replace(" ", "-")
+        account_id = click.prompt("Enter Account ID", default=default_id)
     account_id = account_id.strip()
 
     if not _SAFE_ACCOUNT_ID_RE.match(account_id):
         raise click.BadParameter("Account ID must be alphanumeric and safe for file paths.")
 
-    click.echo("\nSelect cookie source:")
-    click.echo("  1. Firefox profile directory or cookies.sqlite file")
-    click.echo("  2. Manual cookie input (Cookie header, JSON, or __Secure-1PSID)")
-    choice = click.prompt("Choose option [1 or 2]", default="2", type=click.Choice(["1", "2"]))
-
     try:
-        if choice == "1":
-            firefox_path = click.prompt("Enter Firefox cookies.sqlite or profile path")
-            parsed_cookies = extract_firefox_cookies(firefox_path.strip())
+        parsed_cookies: WebCookies | None = None
+        is_interactive = _is_interactive_terminal()
+
+        if firefox_profile and firefox_profile.strip().lower() not in ("default-release", "default"):
+            parsed_cookies = extract_firefox_cookies(firefox_profile.strip())
         else:
-            cookie_input = click.prompt("Enter Cookie header, JSON, or __Secure-1PSID")
-            cleaned_input = cookie_input.strip()
-            if "__Secure-1PSID" in cleaned_input or ";" in cleaned_input or "{" in cleaned_input:
-                parsed_cookies = parse_cookie_header_or_dict(cleaned_input)
-            else:
-                psidts_input = click.prompt(
-                    "Enter __Secure-1PSIDTS (optional)",
+            # If --firefox-profile is not given or is "default-release":
+            # Automatically auto-detect the user's Firefox profile
+            sqlite_path, detected = auto_discover_firefox_cookies()
+            if detected and detected.secure_1psid:
+                parsed_cookies = detected
+                click.secho(
+                    f"✓ Automatically detected Gemini cookies from Firefox ({sqlite_path or 'browser profile'})!",
+                    fg="cyan",
+                )
+            elif is_interactive:
+                click.echo("\nNo active Gemini session found in Firefox.")
+                click.echo("Opening https://gemini.google.com in browser...")
+                try:
+                    import webbrowser
+                    webbrowser.open("https://gemini.google.com")
+                except Exception:
+                    pass
+                click.prompt(
+                    "Sign in to Gemini in Firefox, then press Enter to capture credentials automatically",
                     default="",
                     show_default=False,
                 )
-                parsed_cookies = parse_manual_cookies(cleaned_input, psidts_input)
+                sqlite_path2, detected2 = auto_discover_firefox_cookies()
+                if detected2 and detected2.secure_1psid:
+                    parsed_cookies = detected2
+                    click.secho("✓ Successfully captured cookies from Firefox!", fg="cyan")
+
+        if not parsed_cookies:
+            click.echo("\nSelect cookie source:")
+            click.echo("  1. Firefox profile directory or cookies.sqlite file")
+            click.echo("  2. Manual cookie input (Cookie header, JSON, or __Secure-1PSID)")
+            choice = click.prompt("Choose option [1 or 2]", default="2", type=click.Choice(["1", "2"]))
+
+            if choice == "1":
+                firefox_path = click.prompt("Enter Firefox cookies.sqlite or profile path")
+                parsed_cookies = extract_firefox_cookies(firefox_path.strip())
+            else:
+                cookie_input = click.prompt("Enter Cookie header, JSON, or __Secure-1PSID")
+                cleaned_input = cookie_input.strip()
+                if "__Secure-1PSID" in cleaned_input or ";" in cleaned_input or "{" in cleaned_input:
+                    parsed_cookies = parse_cookie_header_or_dict(cleaned_input)
+                else:
+                    psidts_input = click.prompt(
+                        "Enter __Secure-1PSIDTS (optional)",
+                        default="",
+                        show_default=False,
+                    )
+                    parsed_cookies = parse_manual_cookies(cleaned_input, psidts_input)
 
         cookie_file_path = get_account_cookie_cache_path(account_id)
         account = WebAccount(
             id=account_id,
+            label=label or account_id,
             cookie_file=str(cookie_file_path),
             cookies=parsed_cookies,
             status="ACTIVE",
@@ -483,6 +584,7 @@ def add_web(account_id: str | None) -> None:
 @click.option("--port", "flag_port", type=int, default=None, help="Port to bind when running server.")
 @click.option("--add-oauth", "flag_add_oauth", is_flag=True, help="Add an OAuth CLI account.")
 @click.option("--add-web", "flag_add_web", is_flag=True, help="Add a Web Cookie account.")
+@click.option("--id", "flag_id", type=str, default=None, help="Unique identifier for the account.")
 @click.option("--label", "flag_label", type=str, default=None, help="Account label.")
 @click.option(
     "--mode",
@@ -502,6 +604,7 @@ def cli(
     flag_port: int | None,
     flag_add_oauth: bool,
     flag_add_web: bool,
+    flag_id: str | None,
     flag_label: str | None,
     flag_mode: str,
     flag_firefox_profile: str | None,
@@ -518,12 +621,16 @@ def cli(
         return
     if flag_add_oauth:
         kwargs = {"mode": flag_mode}
+        if flag_id is not None:
+            kwargs["account_id"] = flag_id
         if flag_label is not None:
             kwargs["label"] = flag_label
         ctx.invoke(add_oauth, **kwargs)
         return
     if flag_add_web:
         kwargs = {}
+        if flag_id is not None:
+            kwargs["account_id"] = flag_id
         if flag_firefox_profile is not None:
             kwargs["firefox_profile"] = flag_firefox_profile
         if flag_label is not None:

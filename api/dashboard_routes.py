@@ -45,6 +45,7 @@ from core.auth_oauth_cli import (
 )
 from core.auth_web import (
     ChromiumDBSCUnsupportedError,
+    auto_discover_firefox_cookies,
     extract_firefox_cookies,
     get_account_cookie_cache_path,
     get_saved_info_hygiene_notice,
@@ -65,6 +66,7 @@ from core.usage_monitor import sync_all_registered_accounts
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["Dashboard"])
+callback_router = APIRouter(tags=["OAuth Callback"])
 
 STATIC_DIR: Path = BASE_DIR / "static"
 INDEX_HTML_PATH: Path = STATIC_DIR / "index.html"
@@ -87,6 +89,9 @@ class OAuthInitRequest(BaseModel):
     redirect_uri: str | None = None
     client_id: str | None = None
     verifier_length: int = Field(default=64, ge=43, le=128)
+    label: str = ""
+    max_concurrency: int = Field(default=3, ge=1, le=10)
+    concurrency: int | None = Field(default=None)
 
 
 class OAuthInitResponse(BaseModel):
@@ -130,6 +135,29 @@ class WebAccountAddRequest(BaseModel):
     max_concurrency: int = Field(default=2, ge=1, le=8)
 
 
+class WebAutoDetectRequest(BaseModel):
+    """Payload for auto-detecting Firefox cookies and linking web account."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    account_id: str | None = None
+    label: str = ""
+    max_concurrency: int = Field(default=2, ge=1, le=8)
+    auto_link: bool = True
+    open_browser_if_missing: bool = False
+
+
+class WebBrowserLoginRequest(BaseModel):
+    """Payload for opening browser to gemini.google.com and optional polling."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    account_id: str | None = None
+    label: str = ""
+    max_concurrency: int = Field(default=2, ge=1, le=8)
+    poll_seconds: float = Field(default=0.0, ge=0.0, le=60.0)
+
+
 class ModelRouteUpdateRequest(BaseModel):
     """Payload for updating or creating a model channel route."""
 
@@ -164,6 +192,8 @@ def _store_pending_oauth_session(
     redirect_uri: str,
     client_id: str | None,
     now: float,
+    label: str = "",
+    concurrency: int = 3,
 ) -> None:
     """Store generated PKCE challenge parameters for verification during completion."""
     _prune_expired_oauth_sessions(now)
@@ -171,6 +201,8 @@ def _store_pending_oauth_session(
         "code_verifier": code_verifier,
         "redirect_uri": redirect_uri,
         "client_id": client_id,
+        "label": label,
+        "concurrency": concurrency,
         "created_at": now,
     }
 
@@ -321,7 +353,7 @@ async def _discover_models_for_new_oauth(account: OAuthAccount) -> list[str]:
     except Exception as exc:
         logger.warning("Dynamic model discovery skipped for %s: %s", account.id, exc)
 
-    return ["gemini-3.8-flash", "gemini-3.1-pro", "gemini-3.1-flash-lite"]
+    return []
 
 
 # ============================================================================
@@ -368,6 +400,7 @@ async def init_oauth_account(payload: OAuthInitRequest | None = None) -> OAuthIn
     now = time.time()
     req = payload or OAuthInitRequest()
     redirect_uri = (req.redirect_uri or "http://localhost:8000/oauth/callback").strip()
+    effective_concurrency = req.concurrency if req.concurrency is not None else req.max_concurrency
 
     pkce = generate_pkce_pair(verifier_length=req.verifier_length)
     auth_url = build_authorization_url(
@@ -375,7 +408,15 @@ async def init_oauth_account(payload: OAuthInitRequest | None = None) -> OAuthIn
         pkce=pkce,
         client_id=req.client_id,
     )
-    _store_pending_oauth_session(pkce.state, pkce.code_verifier, redirect_uri, req.client_id, now)
+    _store_pending_oauth_session(
+        state=pkce.state,
+        code_verifier=pkce.code_verifier,
+        redirect_uri=redirect_uri,
+        client_id=req.client_id,
+        now=now,
+        label=req.label.strip(),
+        concurrency=effective_concurrency,
+    )
 
     return OAuthInitResponse(
         auth_url=auth_url,
@@ -440,6 +481,170 @@ async def complete_oauth_account(payload: OAuthCompleteRequest) -> dict[str, Any
     }
 
 
+@callback_router.get("/oauth/callback", response_class=HTMLResponse)
+@router.get("/oauth/callback", response_class=HTMLResponse)
+async def handle_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+) -> HTMLResponse:
+    """Automated browser OAuth redirect handler completing authorization without manual copy-paste."""
+    now = time.time()
+    if error:
+        err_msg = error_description or error
+        return HTMLResponse(
+            content=f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>OAuth Error</title>
+<style>
+body {{ background: #070b12; color: #f8fafc; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+.card {{ background: #0f172a; border: 1px solid #f43f5e; padding: 2rem; border-radius: 12px; text-align: center; max-width: 450px; }}
+h2 {{ color: #f43f5e; }}
+p {{ color: #94a3b8; font-size: 0.9rem; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Google Authorization Denied</h2>
+  <p>{err_msg}</p>
+  <p>You can close this window and try again.</p>
+</div>
+<script>
+if (window.opener) {{
+  window.opener.postMessage({{ type: 'OAUTH_ERROR', error: '{err_msg}' }}, '*');
+}}
+</script>
+</body>
+</html>""",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not code:
+        return HTMLResponse(
+            content="""<!DOCTYPE html><html><body style="background:#070b12;color:#f8fafc;font-family:sans-serif;text-align:center;padding:3rem;"><h3>Missing authorization code.</h3></body></html>""",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    saved_session = _pending_oauth_sessions.pop(state, {}) if state else {}
+    code_verifier = (saved_session.get("code_verifier") or "").strip()
+    redirect_uri = (saved_session.get("redirect_uri") or "http://localhost:8000/oauth/callback").strip()
+    client_id = saved_session.get("client_id")
+    session_label = saved_session.get("label", "")
+    session_concurrency = saved_session.get("concurrency", 3)
+
+    if not code_verifier and not state and len(_pending_oauth_sessions) == 1:
+        first_key = next(iter(_pending_oauth_sessions))
+        fallback_session = _pending_oauth_sessions.pop(first_key)
+        code_verifier = fallback_session.get("code_verifier", "")
+        redirect_uri = fallback_session.get("redirect_uri", redirect_uri)
+        client_id = fallback_session.get("client_id", client_id)
+        session_label = fallback_session.get("label", session_label)
+        session_concurrency = fallback_session.get("concurrency", session_concurrency)
+
+    if not code_verifier:
+        return HTMLResponse(
+            content="""<!DOCTYPE html><html><body style="background:#070b12;color:#f8fafc;font-family:sans-serif;text-align:center;padding:3rem;">
+<h3 style="color:#f43f5e;">Authorization Session Expired or Not Found</h3>
+<p style="color:#94a3b8;">Please return to the dashboard and initiate login again.</p>
+<a href="/dashboard" style="color:#38bdf8;">Return to Dashboard</a>
+</body></html>""",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        clean_code = extract_code_from_manual_input(code, expected_state=state)
+        credentials = await complete_oauth_login(
+            code=clean_code,
+            redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
+            client_id=client_id,
+        )
+    except Exception as exc:
+        logger.error("OAuth token exchange failed during callback: %s", exc)
+        return HTMLResponse(
+            content=f"""<!DOCTYPE html><html><body style="background:#070b12;color:#f8fafc;font-family:sans-serif;text-align:center;padding:3rem;">
+<h3 style="color:#f43f5e;">Token Exchange Failed</h3>
+<p style="color:#94a3b8;">{exc}</p>
+<a href="/dashboard" style="color:#38bdf8;">Return to Dashboard</a>
+</body></html>""",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    acc_id = f"oauth-{credentials.project_id or secrets.token_hex(4)}"
+    validated_id = _validate_account_id(acc_id)
+    account_label = session_label if session_label else f"OAuth CLI ({credentials.project_id or 'CloudCode'})"
+
+    account = OAuthAccount(
+        id=validated_id,
+        label=account_label,
+        transport_mode="http_v1internal",
+        max_concurrency=session_concurrency,
+        credentials=credentials,
+        status="ACTIVE",
+    )
+    account.discovered_models = await _discover_models_for_new_oauth(account)
+
+    state_registry.upsert_oauth_account(account)
+    await save_accounts_snapshot()
+
+    return HTMLResponse(
+        content=f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Google Authorization & Sign-In Successful</title>
+  <style>
+    body {{
+      background: #070b12;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      text-align: center;
+    }}
+    .card {{
+      background: #0f172a;
+      border: 1px solid #10b981;
+      border-radius: 14px;
+      padding: 2.5rem 2rem;
+      max-width: 480px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+    }}
+    h2 {{ color: #10b981; margin-bottom: 0.5rem; font-size: 1.4rem; }}
+    p {{ color: #94a3b8; font-size: 0.95rem; margin-top: 0.5rem; }}
+    .badge {{ display: inline-block; padding: 0.25rem 0.75rem; background: rgba(16,185,129,0.15); color: #10b981; border-radius: 20px; font-weight: 600; font-size: 0.85rem; margin-top: 0.75rem; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>✓ Google Sign-In Successful!</h2>
+    <div class="badge">{validated_id}</div>
+    <p>Google Authorization Successful: account linked with {len(account.discovered_models)} discovered models.</p>
+    <p style="color: #64748b; font-size: 0.8rem; margin-top: 1rem;">Returning to Dashboard...</p>
+  </div>
+  <script>
+    try {{
+      if (window.opener) {{
+        window.opener.postMessage({{ type: 'OAUTH_SUCCESS', account_id: '{validated_id}', success: true }}, '*');
+        window.opener.postMessage({{ type: 'OAUTH_COMPLETE', account_id: '{validated_id}', success: true }}, '*');
+        setTimeout(() => {{ window.close(); }}, 800);
+      }} else {{
+        setTimeout(() => {{ window.location.href = '/dashboard'; }}, 1200);
+      }}
+    }} catch (e) {{
+      setTimeout(() => {{ window.location.href = '/dashboard'; }}, 1200);
+    }}
+  </script>
+</body>
+</html>""",
+        status_code=status.HTTP_200_OK,
+    )
+
+
 @router.delete("/oauth-accounts/{account_id}")
 async def delete_oauth_account(account_id: str) -> dict[str, Any]:
     """Delete an OAuth account from memory registry and persist update to disk."""
@@ -473,25 +678,148 @@ async def add_web_account(payload: WebAccountAddRequest) -> dict[str, Any]:
         cookie_file=str(cookie_file_path),
         cookies=parsed_cookies,
         status="ACTIVE",
-        discovered_models=["gemini-4-argon", "gemini-3.1-pro", "gemini-3.8-flash", "gemini-3.1-flash-lite"],
+        discovered_models=[],
     )
 
     save_account_cookies_isolated(account, sync_snapshot=False)
     state_registry.upsert_web_account(account)
-    await save_accounts_snapshot()
 
     try:
         from core.auth_web import default_web_session_manager
+        from core.model_registry import discover_web_models
         from core.usage_monitor import sync_web_account_usage
         await sync_web_account_usage(account, session_manager=default_web_session_manager)
-    except Exception:
-        pass
+        client = await default_web_session_manager.get_client(account)
+        if client is not None:
+            discovered = await discover_web_models(account, client)
+            if discovered:
+                account.discovered_models = discovered
+    except Exception as exc:
+        logger.warning("Web account setup or model discovery skipped for %s: %s", validated_id, exc)
+
+    await save_accounts_snapshot()
 
     return {
         "success": True,
         "message": f"Web account '{validated_id}' registered successfully.",
         "account": _build_web_account_telemetry(account, now),
         "hygiene_notice": get_saved_info_hygiene_notice(),
+    }
+
+
+@router.post("/web-accounts/auto-detect")
+async def auto_detect_web_account(payload: WebAutoDetectRequest | None = None) -> dict[str, Any]:
+    """Auto-detect active Gemini session from Firefox/browser and link account immediately."""
+    req = payload or WebAutoDetectRequest()
+    sqlite_path, cookies = auto_discover_firefox_cookies()
+
+    if not cookies or not cookies.secure_1psid:
+        if req.open_browser_if_missing:
+            try:
+                import webbrowser
+                webbrowser.open("https://gemini.google.com")
+            except Exception as exc:
+                logger.warning("Failed to open browser: %s", exc)
+        return {
+            "success": False,
+            "logged_in": False,
+            "login_url": "https://gemini.google.com",
+            "message": "No active Gemini session found in Firefox. Please sign in to https://gemini.google.com.",
+        }
+
+    if not req.auto_link:
+        return {
+            "success": True,
+            "logged_in": True,
+            "source_path": str(sqlite_path) if sqlite_path else None,
+            "cookies": {
+                "secure_1psid": cookies.secure_1psid,
+                "secure_1psidts": cookies.secure_1psidts,
+            },
+        }
+
+    now = time.time()
+    raw_id = (req.account_id or "").strip() or f"web-{secrets.token_hex(4)}"
+    validated_id = _validate_account_id(raw_id)
+    cookie_file_path = get_account_cookie_cache_path(validated_id)
+    account_label = req.label.strip() or f"Firefox Web ({validated_id})"
+
+    account = WebAccount(
+        id=validated_id,
+        label=account_label,
+        max_concurrency=req.max_concurrency,
+        cookie_file=str(cookie_file_path),
+        cookies=cookies,
+        status="ACTIVE",
+        discovered_models=[
+            "gemini-4-argon",
+            "gemini-3.1-pro",
+            "gemini-3.8-flash",
+            "gemini-3.1-flash-lite",
+        ],
+    )
+
+    save_account_cookies_isolated(account, sync_snapshot=False)
+    state_registry.upsert_web_account(account)
+
+    try:
+        from core.auth_web import default_web_session_manager
+        from core.model_registry import discover_web_models
+        from core.usage_monitor import sync_web_account_usage
+        await sync_web_account_usage(account, session_manager=default_web_session_manager)
+        client = await default_web_session_manager.get_client(account)
+        if client is not None:
+            discovered = await discover_web_models(account, client)
+            if discovered:
+                account.discovered_models = discovered
+    except Exception as exc:
+        logger.warning("Auto-detected web account discovery warning: %s", exc)
+
+    await save_accounts_snapshot()
+
+    return {
+        "success": True,
+        "logged_in": True,
+        "account_id": validated_id,
+        "source_path": str(sqlite_path) if sqlite_path else None,
+        "message": f"Successfully auto-detected and linked Web account '{validated_id}'!",
+        "account": _build_web_account_telemetry(account, now),
+        "hygiene_notice": get_saved_info_hygiene_notice(),
+    }
+
+
+@router.post("/web-accounts/browser-login")
+async def trigger_web_browser_login(payload: WebBrowserLoginRequest | None = None) -> dict[str, Any]:
+    """Open https://gemini.google.com in browser and optionally poll for cookies."""
+    req = payload or WebBrowserLoginRequest()
+    login_url = "https://gemini.google.com"
+
+    try:
+        import webbrowser
+        webbrowser.open(login_url)
+    except Exception as exc:
+        logger.warning("Failed to open browser: %s", exc)
+
+    if req.poll_seconds > 0:
+        start_t = time.time()
+        while time.time() - start_t < req.poll_seconds:
+            await asyncio.sleep(1.0)
+            path, cookies = auto_discover_firefox_cookies()
+            if cookies and cookies.secure_1psid:
+                return await auto_detect_web_account(
+                    WebAutoDetectRequest(
+                        account_id=req.account_id,
+                        label=req.label,
+                        max_concurrency=req.max_concurrency,
+                        auto_link=True,
+                    )
+                )
+
+    return {
+        "success": True,
+        "logged_in": False,
+        "login_url": login_url,
+        "message": "Opened https://gemini.google.com in browser. Sign in and then click Auto-Detect.",
     }
 
 
@@ -558,6 +886,8 @@ async def get_model_routes() -> dict[str, Any]:
         primary, failover = get_model_channel_preference(clean_id)
         is_custom = clean_id in custom_routes
         support = unified_model_registry.get_supporting_accounts(clean_id, active_only=False)
+        oauth_count = len(support.get("oauth", []))
+        web_count = len(support.get("web", []))
         routes.append({
             "model": clean_id,
             "primary_channel": primary,
@@ -565,10 +895,10 @@ async def get_model_routes() -> dict[str, Any]:
             "primary": primary,
             "failover": failover,
             "is_custom": is_custom,
-            "is_discovered": True,
+            "is_discovered": (oauth_count > 0 or web_count > 0),
             "supporting_accounts": {
-                "oauth": len(support.get("oauth", [])),
-                "web": len(support.get("web", [])),
+                "oauth": oauth_count,
+                "web": web_count,
             },
         })
 
@@ -580,6 +910,8 @@ async def get_model_routes() -> dict[str, Any]:
         seen_models.add(clean_alias)
         primary, failover = get_model_channel_preference(clean_alias)
         support = unified_model_registry.get_supporting_accounts(clean_alias, active_only=False)
+        oauth_count = len(support.get("oauth", []))
+        web_count = len(support.get("web", []))
         routes.append({
             "model": clean_alias,
             "primary_channel": primary,
@@ -587,10 +919,10 @@ async def get_model_routes() -> dict[str, Any]:
             "primary": primary,
             "failover": failover,
             "is_custom": True,
-            "is_discovered": False,
+            "is_discovered": (oauth_count > 0 or web_count > 0),
             "supporting_accounts": {
-                "oauth": len(support.get("oauth", [])),
-                "web": len(support.get("web", [])),
+                "oauth": oauth_count,
+                "web": web_count,
             },
         })
 

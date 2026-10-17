@@ -24,7 +24,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
-from api.dashboard_routes import router as dashboard_router
+from api.dashboard_routes import (
+    _pending_oauth_sessions,
+    callback_router,
+    router as dashboard_router,
+)
 from config.settings import (
     ModelQuota,
     OAuthAccount,
@@ -41,6 +45,7 @@ from config.settings import (
 def clean_state_and_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Isolate registry and storage paths for each test execution."""
     state_registry.reset()
+    _pending_oauth_sessions.clear()
 
     test_accounts_file = tmp_path / "accounts.json"
     test_cookies_dir = tmp_path / "cookies_cache"
@@ -54,12 +59,14 @@ def clean_state_and_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yield
 
     state_registry.reset()
+    _pending_oauth_sessions.clear()
 
 
 @pytest.fixture
 def app() -> FastAPI:
     """Create FastAPI application mounting dashboard router."""
     test_app = FastAPI(title="Test Gateway")
+    test_app.include_router(callback_router)
     test_app.include_router(dashboard_router)
     return test_app
 
@@ -235,6 +242,51 @@ def test_complete_oauth_account_missing_verifier_raises_bad_request(client: Test
     )
     assert response.status_code == 400
     assert "Missing code_verifier" in response.json()["detail"]
+
+
+def test_oauth_callback_browser_success(client: TestClient):
+    """Verify /oauth/callback automatically exchanges token, registers account, and renders success HTML."""
+    init_res = client.post("/api/oauth-accounts/init")
+    assert init_res.status_code == 200
+    state = init_res.json()["state"]
+
+    mock_credentials = OAuthCredentials(
+        access_token="mock_access_token_browser",
+        refresh_token="mock_refresh_token_browser",
+        project_id="test-auto-browser-proj",
+    )
+
+    with patch("api.dashboard_routes.complete_oauth_login", new_callable=AsyncMock) as mock_login, \
+         patch("api.dashboard_routes.discover_oauth_models", new_callable=AsyncMock) as mock_models:
+        mock_login.return_value = mock_credentials
+        mock_models.return_value = ["gemini-3.8-flash"]
+
+        response = client.get(f"/oauth/callback?code=mock_code_123&state={state}")
+        assert response.status_code == 200
+        assert "text/html" in response.headers["content-type"]
+        assert "Google Authorization Successful" in response.text
+        assert "oauth-test-auto-browser-proj" in response.text
+
+        # Verify account registered in state_registry with discovered model
+        acc = state_registry.get_oauth_account("oauth-test-auto-browser-proj")
+        assert acc is not None
+        assert acc.discovered_models == ["gemini-3.8-flash"]
+
+
+def test_oauth_callback_error_handling(client: TestClient):
+    """Verify /oauth/callback properly handles Google access_denied errors."""
+    response = client.get("/oauth/callback?error=access_denied&error_description=User+declined+permissions")
+    assert response.status_code == 400
+    assert "text/html" in response.headers["content-type"]
+    assert "Google Authorization Denied" in response.text
+    assert "User declined permissions" in response.text
+
+
+def test_oauth_callback_expired_session(client: TestClient):
+    """Verify /oauth/callback rejects expired or non-existent state sessions."""
+    response = client.get("/oauth/callback?code=code123&state=nonexistent_state_abc")
+    assert response.status_code == 400
+    assert "Authorization Session Expired or Not Found" in response.text
 
 
 def test_delete_oauth_account_removes_from_registry(client: TestClient):
@@ -423,3 +475,80 @@ def test_dashboard_ui_endpoint_serves_html(client: TestClient):
     assert response.status_code == 200
     assert "text/html" in response.headers.get("content-type", "")
     assert "Gemini Hybrid Pool Gateway" in response.text
+
+
+def test_oauth_callback_preserves_label_and_concurrency(client: TestClient):
+    """Verify /oauth/callback honors label and concurrency saved in pending session."""
+    init_res = client.post(
+        "/api/oauth-accounts/init",
+        json={"label": "Custom CLI Team", "max_concurrency": 5},
+    )
+    assert init_res.status_code == 200
+    state = init_res.json()["state"]
+
+    mock_credentials = OAuthCredentials(
+        access_token="mock_tok",
+        refresh_token="mock_ref",
+        project_id="team-proj-999",
+    )
+
+    with patch("api.dashboard_routes.complete_oauth_login", new_callable=AsyncMock) as mock_login, \
+         patch("api.dashboard_routes.discover_oauth_models", new_callable=AsyncMock) as mock_models:
+        mock_login.return_value = mock_credentials
+        mock_models.return_value = ["gemini-3.8-flash"]
+
+        response = client.get(f"/oauth/callback?code=code_xyz&state={state}")
+        assert response.status_code == 200
+        assert "OAUTH_SUCCESS" in response.text
+        assert "OAUTH_COMPLETE" in response.text
+
+        acc = state_registry.get_oauth_account("oauth-team-proj-999")
+        assert acc is not None
+        assert acc.label == "Custom CLI Team"
+        assert acc.max_concurrency == 5
+
+
+def test_web_account_auto_detect_success(client: TestClient):
+    """Verify POST /api/web-accounts/auto-detect detects cookies and registers account."""
+    mock_cookies = WebCookies(secure_1psid="auto_psid_123", secure_1psidts="auto_ts_456")
+    with patch("api.dashboard_routes.auto_discover_firefox_cookies", return_value=(Path("fake/cookies.sqlite"), mock_cookies)):
+        response = client.post(
+            "/api/web-accounts/auto-detect",
+            json={"label": "Auto Detected Firefox", "max_concurrency": 3},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        assert payload["logged_in"] is True
+        assert payload["account"]["label"] == "Auto Detected Firefox"
+
+        acc = state_registry.get_web_account(payload["account_id"])
+        assert acc is not None
+        assert acc.cookies.secure_1psid == "auto_psid_123"
+        assert acc.max_concurrency == 3
+
+
+def test_web_account_auto_detect_not_logged_in(client: TestClient):
+    """Verify POST /api/web-accounts/auto-detect returns logged_in=False when not found."""
+    with patch("api.dashboard_routes.auto_discover_firefox_cookies", return_value=(None, None)):
+        response = client.post("/api/web-accounts/auto-detect")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is False
+        assert payload["logged_in"] is False
+        assert "login_url" in payload
+
+
+def test_web_account_browser_login_endpoint(client: TestClient):
+    """Verify POST /api/web-accounts/browser-login opens browser and returns login URL."""
+    with patch("webbrowser.open") as mock_open:
+        response = client.post(
+            "/api/web-accounts/browser-login",
+            json={"poll_seconds": 0},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        assert payload["login_url"] == "https://gemini.google.com"
+        mock_open.assert_called_once_with("https://gemini.google.com")
+

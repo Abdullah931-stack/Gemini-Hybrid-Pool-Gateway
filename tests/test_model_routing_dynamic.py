@@ -260,27 +260,52 @@ def test_select_optimal_account_honors_custom_route(isolate_model_routes_file: P
 # ============================================================================
 
 
-def test_api_get_model_routes_empty_custom(client: TestClient) -> None:
-    """GET /api/model-routes returns discovered models and system defaults."""
+def test_api_get_model_routes_empty_pool(client: TestClient) -> None:
+    """GET /api/model-routes returns empty list when no accounts/routes exist."""
     response = client.get("/api/model-routes")
     assert response.status_code == 200
 
     data = response.json()
     assert data["success"] is True
     assert isinstance(data["routes"], list)
-    assert len(data["routes"]) > 0
+    assert len(data["routes"]) == 0
 
-    # Check that standard models exist in routes
+
+def test_api_get_model_routes_with_discovered_models(client: TestClient) -> None:
+    """GET /api/model-routes returns routes for actually discovered models."""
+    oauth_acc = OAuthAccount(
+        id="oauth-routes-test",
+        status="ACTIVE",
+        credentials=OAuthCredentials(access_token="tok"),
+        discovered_models=["gemini-3.8-flash", "gemini-3.1-pro"],
+    )
+    state_registry.upsert_oauth_account(oauth_acc)
+
+    web_acc = WebAccount(
+        id="web-routes-test",
+        status="ACTIVE",
+        discovered_models=["gemini-4-argon"],
+    )
+    state_registry.upsert_web_account(web_acc)
+
+    response = client.get("/api/model-routes")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["success"] is True
+    assert isinstance(data["routes"], list)
+    assert len(data["routes"]) == 3
+
     model_names = [r["model"] for r in data["routes"]]
     assert "gemini-4-argon" in model_names
     assert "gemini-3.1-pro" in model_names
     assert "gemini-3.8-flash" in model_names
 
-    # Check argon default
     argon_route = next(r for r in data["routes"] if r["model"] == "gemini-4-argon")
     assert argon_route["primary_channel"] == "web"
     assert argon_route["failover_channel"] is None
     assert argon_route["is_custom"] is False
+    assert argon_route["is_discovered"] is True
 
 
 def test_api_post_model_routes_update_and_persist(client: TestClient, isolate_model_routes_file: Path) -> None:

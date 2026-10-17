@@ -57,6 +57,7 @@ from core.auth_web import (
     ActiveRequestsConcurrencyError,
     ChromiumDBSCUnsupportedError,
     WebSessionManager,
+    auto_discover_firefox_cookies,
     extract_client_web_cookies,
     extract_firefox_cookies,
     get_account_cookie_cache_path,
@@ -611,3 +612,68 @@ async def test_flush_all_cookies(tmp_path: Path) -> None:
     loaded2 = load_account_cookies_isolated("acc_flush_2", cache_dir=cache_dir)
     assert loaded1 is not None and loaded1.secure_1psidts == "rotated_ts_1"
     assert loaded2 is not None and loaded2.secure_1psidts == "rotated_ts_2"
+
+
+def test_auto_discover_firefox_cookies_from_profile_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify auto_discover_firefox_cookies discovers and extracts from .default-release profile."""
+    fake_appdata = tmp_path / "AppData" / "Roaming"
+    profile_dir = fake_appdata / "Mozilla" / "Firefox" / "Profiles" / "abc12345.default-release"
+    db_file = profile_dir / "cookies.sqlite"
+    create_mock_firefox_sqlite(db_file, psid="auto_discovered_psid", psidts="auto_discovered_ts")
+
+    monkeypatch.setenv("APPDATA", str(fake_appdata))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    path, cookies = auto_discover_firefox_cookies()
+    assert path is not None
+    assert path.resolve() == db_file.resolve()
+    assert cookies is not None
+    assert cookies.secure_1psid == "auto_discovered_psid"
+    assert cookies.secure_1psidts == "auto_discovered_ts"
+
+
+def test_auto_discover_firefox_cookies_fallback_to_browser_cookie3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify auto_discover_firefox_cookies falls back to browser_cookie3 when no profile DB exists."""
+    empty_appdata = tmp_path / "EmptyAppData"
+    empty_appdata.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("APPDATA", str(empty_appdata))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    mock_cookie1 = MagicMock()
+    mock_cookie1.name = "__Secure-1PSID"
+    mock_cookie1.value = "browser3_psid"
+
+    mock_cookie2 = MagicMock()
+    mock_cookie2.name = "__Secure-1PSIDTS"
+    mock_cookie2.value = "browser3_ts"
+
+    mock_bc3 = MagicMock()
+    mock_bc3.firefox.return_value = [mock_cookie1, mock_cookie2]
+    monkeypatch.setattr("core.auth_web.browser_cookie3", mock_bc3)
+
+    path, cookies = auto_discover_firefox_cookies()
+    assert path is None
+    assert cookies is not None
+    assert cookies.secure_1psid == "browser3_psid"
+    assert cookies.secure_1psidts == "browser3_ts"
+
+
+def test_auto_discover_firefox_cookies_returns_none_when_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify auto_discover_firefox_cookies returns (None, None) when no cookies found anywhere."""
+    empty_appdata = tmp_path / "EmptyAppData"
+    empty_appdata.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("APPDATA", str(empty_appdata))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    mock_bc3 = MagicMock()
+    mock_bc3.firefox.return_value = []
+    monkeypatch.setattr("core.auth_web.browser_cookie3", mock_bc3)
+
+    path, cookies = auto_discover_firefox_cookies()
+    assert path is None
+    assert cookies is None
+

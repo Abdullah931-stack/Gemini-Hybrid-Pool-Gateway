@@ -733,9 +733,9 @@
 
     <!-- Top KPI Grid -->
     <div class="kpi-grid">
-      <div class="kpi-card status-healthy" id="cardPoolHealth">
+      <div class="kpi-card status-empty" id="cardPoolHealth">
         <div class="kpi-title">Pool Status</div>
-        <div class="kpi-value" id="kpiPoolStatus">HEALTHY</div>
+        <div class="kpi-value" id="kpiPoolStatus">EMPTY</div>
         <div class="kpi-subtitle" id="kpiAccountsSummary">Active Pool Nodes</div>
       </div>
       <div class="kpi-card">
@@ -751,7 +751,7 @@
       <div class="kpi-card">
         <div class="kpi-title">Supported Models</div>
         <div class="kpi-value" id="kpiModelsCount">0</div>
-        <div class="kpi-subtitle">Discovered across cluster</div>
+        <div class="kpi-subtitle" id="kpiModelsSubtitle">Add an account to discover models</div>
       </div>
     </div>
 
@@ -786,10 +786,7 @@
   "provider": "openai-compatible",
   "base_url": "http://localhost:8000/v1",
   "api_key": "sk-gemini-hybrid-pool",
-  "main_agent_model": "gemini-4-argon",
-  "sub_agent_model": "gemini-3.8-flash",
-  "fallback_model": "gemini-3.1-flash-lite",
-  "max_parallel_sub_agents": 8
+  "note": "Connect an account to discover active model names"
 }</code></pre>
       </div>
     </div>
@@ -850,7 +847,7 @@
           </thead>
           <tbody id="modelRoutesTableBody">
             <tr>
-              <td colspan="6" style="text-align: center; color: var(--text-dim); padding: 2rem;">Loading model routes...</td>
+              <td colspan="6" style="text-align: center; color: var(--text-dim); padding: 2rem;">No active models or routes in the pool. Link an OAuth CLI or Web Cookie account to discover models.</td>
             </tr>
           </tbody>
         </table>
@@ -867,7 +864,7 @@
     <div class="pool-grid" id="gridOAuthAccounts">
       <div class="empty-placeholder">
         <h3>No OAuth Accounts Registered</h3>
-        <p>Click "+ Add OAuth Account" to authorize an Antigravity CLI account.</p>
+        <p>Click "+ Add OAuth Account" to sign in with your Google account.</p>
       </div>
     </div>
 
@@ -881,7 +878,7 @@
     <div class="pool-grid" id="gridWebAccounts">
       <div class="empty-placeholder">
         <h3>No Web Accounts Registered</h3>
-        <p>Click "+ Add Web Account" to link a Firefox profile or paste session cookies.</p>
+        <p>Click "+ Add Web Account" to link your Gemini web session.</p>
       </div>
     </div>
 
@@ -895,45 +892,57 @@
   <div class="modal-overlay" id="modalOAuth">
     <div class="modal-card">
       <div class="modal-header">
-        <div class="modal-title">Authorize OAuth CLI Account</div>
+        <div class="modal-title">Connect Google Account (OAuth CLI)</div>
         <button class="modal-close" onclick="closeOAuthModal()">&times;</button>
       </div>
-      <div id="oauthStep1">
-        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
-          Step 1: Generate a secure PKCE authorization URL and sign in with your Google Account.
+
+      <div style="text-align: center; padding: 1rem 0;">
+        <div style="font-size: 2.8rem; margin-bottom: 0.5rem;">🔐</div>
+        <h3 style="font-size: 1.1rem; margin-bottom: 0.5rem;">Automatic Google Sign-In</h3>
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem; line-height: 1.5;">
+          Click the button below to sign in with Google. Your browser will open the consent screen, and your account will automatically connect without copying any tokens.
         </p>
-        <div class="form-group">
-          <label class="form-label">Redirect URI</label>
-          <input type="text" class="form-input" id="oauthRedirectUri" value="http://localhost:8000/oauth/callback" />
+
+        <div class="form-group" style="text-align: left; margin-bottom: 1.25rem;">
+          <label class="form-label">Account Label (Optional)</label>
+          <input type="text" class="form-input" id="oauthModalLabel" placeholder="e.g. Primary CloudCode" />
         </div>
-        <button class="btn btn-primary" style="width: 100%; margin-top: 0.5rem;" onclick="generateOAuthUrl()">
-          <span>Generate Auth URL & Open Consent Screen</span>
+
+        <button class="btn btn-primary" id="btnStartGoogleOAuth" style="width: 100%; padding: 0.75rem 1.25rem; font-size: 0.95rem; justify-content: center; box-shadow: 0 4px 15px rgba(2, 132, 199, 0.4);" onclick="startAutomaticGoogleOAuth()">
+          <span>🚀 Sign in with Google (One-Click)</span>
         </button>
+
+        <div id="oauthWaitingSpinner" style="display: none; margin-top: 1.25rem; padding: 1rem; background: var(--bg-card-subtle); border-radius: var(--radius-sm); border: 1px solid var(--border-color);">
+          <div style="display: flex; align-items: center; justify-content: center; gap: 0.75rem; color: var(--accent-cyan); font-size: 0.88rem;">
+            <span class="badge-dot" style="background: var(--accent-cyan); animation: pulse 1s infinite;"></span>
+            <span>Awaiting authorization in browser window...</span>
+          </div>
+          <p style="font-size: 0.78rem; color: var(--text-dim); margin-top: 0.5rem;">
+            If the window didn't open automatically, <a href="#" id="linkOAuthManualOpen" target="_blank" style="color: var(--accent-cyan);">click here to open login</a>.
+          </p>
+        </div>
       </div>
 
-      <div id="oauthStep2" style="display: none; margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border-color);">
-        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
-          Step 2: Paste the authorization code or full callback URL returned by Google.
-        </p>
-        <div class="form-group">
-          <label class="form-label">Authorization Code or Callback URL *</label>
-          <textarea class="form-textarea" id="oauthCodeInput" placeholder="4/0AWtg... or http://localhost:8000/oauth/callback?code=..."></textarea>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Account ID (Optional, auto-generated if blank)</label>
-          <input type="text" class="form-input" id="oauthAccountId" placeholder="e.g. oauth-pro-1" />
-        </div>
-        <div class="form-group">
-          <label class="form-label">Account Label</label>
-          <input type="text" class="form-input" id="oauthAccountLabel" placeholder="e.g. Primary Dev Account" />
-        </div>
-        <div class="form-group">
-          <label class="form-label">Max Concurrency ($C_{\text{max}}$)</label>
-          <input type="number" class="form-input" id="oauthConcurrency" value="3" min="1" max="10" />
-        </div>
-        <button class="btn btn-success" style="width: 100%;" onclick="completeOAuthSubmission()">
-          <span>Complete Authorization & Save</span>
-        </button>
+      <!-- Collapsible Advanced / Headless Manual Option -->
+      <div style="margin-top: 1rem; border-top: 1px solid var(--border-color); padding-top: 0.75rem;">
+        <details style="font-size: 0.8rem; color: var(--text-dim);">
+          <summary style="cursor: pointer; padding: 0.25rem 0; color: var(--text-muted);">
+            🛠️ Advanced / Headless server manual code entry
+          </summary>
+          <div style="margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.75rem;">
+            <div class="form-group">
+              <label class="form-label">Authorization Code or Full Callback URL</label>
+              <textarea class="form-textarea" id="oauthCodeInput" placeholder="Paste 4/0AWtg... or callback URL if using remote/headless server"></textarea>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Account Label (Optional)</label>
+              <input type="text" class="form-input" id="oauthAccountLabel" placeholder="e.g. Primary CloudCode" />
+            </div>
+            <button class="btn btn-outline btn-sm" onclick="completeOAuthSubmission()">
+              <span>Manually Complete Authorization</span>
+            </button>
+          </div>
+        </details>
       </div>
     </div>
   </div>
@@ -942,55 +951,88 @@
   <div class="modal-overlay" id="modalWeb">
     <div class="modal-card">
       <div class="modal-header">
-        <div class="modal-title">Add Web Cookie Account</div>
+        <div class="modal-title">Link Gemini Web Session</div>
         <button class="modal-close" onclick="closeWebModal()">&times;</button>
       </div>
-      <div class="alert">
+
+      <div style="text-align: center; padding: 0.5rem 0 1rem 0;">
+        <div style="font-size: 2.5rem; margin-bottom: 0.25rem;">🌐</div>
+        <h3 style="font-size: 1.05rem; margin-bottom: 0.35rem;">1-Click Browser Cookie Import</h3>
+        <p style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 1.25rem; line-height: 1.4;">
+          Automatically capture your logged-in Google Gemini session from Firefox with zero manual copy-pasting.
+        </p>
+
+        <div class="form-group" style="text-align: left; margin-bottom: 1rem;">
+          <label class="form-label">Account Label (Optional)</label>
+          <input type="text" class="form-input" id="webAccountLabel" placeholder="e.g. Gemini Pro Web" />
+        </div>
+
+        <button class="btn btn-success" id="btnAutoDetectWeb" style="width: 100%; padding: 0.75rem 1.25rem; font-size: 0.95rem; justify-content: center; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.4);" onclick="autoDetectWebAccount()">
+          <span>🌐 1-Click Auto-Detect from Browser / Firefox</span>
+        </button>
+
+        <!-- Dynamic Status / Sign-In Guidance Area -->
+        <div id="webAutoDetectNotice" style="display: none; margin-top: 1rem; padding: 0.9rem; background: var(--bg-card-subtle); border-radius: var(--radius-sm); border: 1px solid var(--border-color); text-align: left;">
+          <div style="display: flex; align-items: center; gap: 0.5rem; color: var(--accent-amber); font-size: 0.85rem; font-weight: 600;">
+            <span>⚠️</span>
+            <span id="webNoticeHeading">Not Signed In</span>
+          </div>
+          <p id="webNoticeBody" style="font-size: 0.8rem; color: var(--text-muted); margin: 0.4rem 0 0.8rem 0; line-height: 1.4;">
+            No active session detected. Click below to open Gemini in your browser, sign in with your Google account, and click auto-detect!
+          </p>
+          <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+            <button class="btn btn-primary btn-sm" onclick="openGeminiInBrowser()">
+              <span>🚀 Open Gemini in Browser to Sign In</span>
+            </button>
+            <button class="btn btn-outline btn-sm" onclick="autoDetectWebAccount()">
+              <span>🔄 I've Signed In - Capture Cookies Now</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="alert" style="margin-top: 0.5rem;">
         ⚠️ <strong>Hygiene Notice:</strong> Disable "Saved Info" at
         <a href="https://gemini.google.com/saved-info" target="_blank" style="color: #38bdf8;">gemini.google.com/saved-info</a>
-        before adding. If pasting cookies from Private/Incognito, close the private tab immediately without signing out.
+        before adding.
       </div>
-      <div class="form-group">
-        <label class="form-label">Account ID *</label>
-        <input type="text" class="form-input" id="webAccountId" placeholder="e.g. web-account-1" />
+
+      <!-- Collapsible Manual / Advanced Option -->
+      <div style="margin-top: 0.5rem; border-top: 1px solid var(--border-color); padding-top: 0.75rem;">
+        <details style="font-size: 0.8rem; color: var(--text-dim);">
+          <summary style="cursor: pointer; padding: 0.25rem 0; color: var(--text-muted);">
+            🛠️ Advanced / Manual cookie paste or custom Firefox profile path
+          </summary>
+          <div style="margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.75rem;">
+            <div class="form-group">
+              <label class="form-label">Input Method</label>
+              <select class="form-select" id="webInputMethod" onchange="toggleWebInputFields()">
+                <option value="paste">Paste Cookies String / Header (__Secure-1PSID / TS)</option>
+                <option value="firefox">Custom Firefox Profile Directory / SQLite</option>
+              </select>
+            </div>
+            <div class="form-group" id="fieldWebCookies">
+              <label class="form-label">Cookie String or Header</label>
+              <textarea class="form-textarea" id="webCookiesText" placeholder="__Secure-1PSID=...; __Secure-1PSIDTS=..."></textarea>
+            </div>
+            <div class="form-group" id="fieldWebFirefox" style="display: none;">
+              <label class="form-label">Firefox Profile Directory</label>
+              <input type="text" class="form-input" id="webFirefoxPath" placeholder="C:\Users\...\AppData\Roaming\Mozilla\Firefox\Profiles\xyz.default-release" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">Account ID (Optional, auto-generated if blank)</label>
+              <input type="text" class="form-input" id="webAccountId" placeholder="e.g. web-pro-1" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">Max Concurrency ($C_{\text{max}}$)</label>
+              <input type="number" class="form-input" id="webConcurrency" value="2" min="1" max="8" />
+            </div>
+            <button class="btn btn-outline btn-sm" onclick="submitWebAccount()">
+              <span>Manually Register Web Account</span>
+            </button>
+          </div>
+        </details>
       </div>
-      <div class="form-group">
-        <label class="form-label">Account Label</label>
-        <input type="text" class="form-input" id="webAccountLabel" placeholder="e.g. Secondary Pro Account" />
-      </div>
-      <div class="form-group">
-        <label class="form-label">Cookie Input Method</label>
-        <select class="form-select" id="webInputMethod" onchange="toggleWebInputFields()">
-          <option value="paste">Paste Cookies String / JSON</option>
-          <option value="firefox">Firefox Profile Path</option>
-          <option value="tokens">Direct __Secure-1PSID / 1PSIDTS</option>
-        </select>
-      </div>
-      <div class="form-group" id="fieldWebCookies">
-        <label class="form-label">Raw Cookie Header or JSON</label>
-        <textarea class="form-textarea" id="webCookiesText" placeholder="Cookie: __Secure-1PSID=...; __Secure-1PSIDTS=..."></textarea>
-      </div>
-      <div class="form-group" id="fieldWebFirefox" style="display: none;">
-        <label class="form-label">Firefox Profile Directory / cookies.sqlite</label>
-        <input type="text" class="form-input" id="webFirefoxPath" placeholder="C:\Users\...\AppData\Roaming\Mozilla\Firefox\Profiles\xyz.default-release" />
-      </div>
-      <div id="fieldWebTokens" style="display: none;">
-        <div class="form-group">
-          <label class="form-label">__Secure-1PSID *</label>
-          <input type="text" class="form-input" id="webPsid" placeholder="g.a000..." />
-        </div>
-        <div class="form-group">
-          <label class="form-label">__Secure-1PSIDTS (Optional)</label>
-          <input type="text" class="form-input" id="webPsidts" placeholder="sidts-..." />
-        </div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Max Concurrency ($C_{\text{max}}$)</label>
-        <input type="number" class="form-input" id="webConcurrency" value="2" min="1" max="8" />
-      </div>
-      <button class="btn btn-success" style="width: 100%; margin-top: 0.5rem;" onclick="submitWebAccount()">
-        <span>Register Web Account</span>
-      </button>
     </div>
   </div>
 
@@ -1034,17 +1076,40 @@
     }
 
     // Modal controls
+    let oauthCheckInterval = null;
+
     function openOAuthModal() {
       document.getElementById("modalOAuth").classList.add("active");
-      document.getElementById("oauthStep1").style.display = "block";
-      document.getElementById("oauthStep2").style.display = "none";
+      const btn = document.getElementById("btnStartGoogleOAuth");
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = "<span>🚀 Sign in with Google (One-Click)</span>";
+      }
+      const spinner = document.getElementById("oauthWaitingSpinner");
+      if (spinner) spinner.style.display = "none";
+      const lblInput = document.getElementById("oauthModalLabel");
+      if (lblInput) lblInput.value = "";
     }
+
     function closeOAuthModal() {
       document.getElementById("modalOAuth").classList.remove("active");
+      if (oauthCheckInterval) {
+        clearInterval(oauthCheckInterval);
+        oauthCheckInterval = null;
+      }
     }
+
     function openWebModal() {
       document.getElementById("modalWeb").classList.add("active");
+      const notice = document.getElementById("webAutoDetectNotice");
+      if (notice) notice.style.display = "none";
+      const btn = document.getElementById("btnAutoDetectWeb");
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = "<span>🌐 1-Click Auto-Detect from Browser / Firefox</span>";
+      }
     }
+
     function closeWebModal() {
       document.getElementById("modalWeb").classList.remove("active");
     }
@@ -1053,7 +1118,6 @@
       const method = document.getElementById("webInputMethod").value;
       document.getElementById("fieldWebCookies").style.display = method === "paste" ? "block" : "none";
       document.getElementById("fieldWebFirefox").style.display = method === "firefox" ? "block" : "none";
-      document.getElementById("fieldWebTokens").style.display = method === "tokens" ? "block" : "none";
     }
 
     // API calls
@@ -1085,23 +1149,146 @@
       }
     }
 
-    async function generateOAuthUrl() {
-      const redirectUri = document.getElementById("oauthRedirectUri").value.trim();
+    async function startAutomaticGoogleOAuth() {
+      const btn = document.getElementById("btnStartGoogleOAuth");
+      const spinner = document.getElementById("oauthWaitingSpinner");
+      const manualLink = document.getElementById("linkOAuthManualOpen");
+      const label = (document.getElementById("oauthModalLabel")?.value || "").trim();
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = "<span>⏳ Connecting to Google...</span>";
+      }
+
       try {
+        const redirectUri = `${window.location.origin}/oauth/callback`;
         const resp = await fetch("/api/oauth-accounts/init", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ redirect_uri: redirectUri }),
+          body: JSON.stringify({ redirect_uri: redirectUri, label: label }),
         });
         if (!resp.ok) throw new Error(await resp.text());
         const data = await resp.json();
         currentOAuthSession = data;
-        window.open(data.auth_url, "_blank");
-        document.getElementById("oauthStep2").style.display = "block";
-        showToast("Authorization URL opened in new tab!");
+
+        if (spinner) spinner.style.display = "block";
+        if (manualLink) manualLink.href = data.auth_url;
+
+        const width = 600, height = 700;
+        const left = window.screen.width / 2 - width / 2;
+        const top = window.screen.height / 2 - height / 2;
+        window.open(
+          data.auth_url,
+          'GoogleAuth',
+          `toolbar=no,location=no,status=no,menubar=no,scrollbars=yes,resizable=yes,width=${width},height=${height},top=${top},left=${left}`
+        );
+
+        const initialCount = (window.lastTelemetry && window.lastTelemetry.oauth_accounts)
+          ? window.lastTelemetry.oauth_accounts.length
+          : 0;
+
+        if (oauthCheckInterval) clearInterval(oauthCheckInterval);
+        oauthCheckInterval = setInterval(async () => {
+          try {
+            const statusResp = await fetch("/api/status");
+            if (statusResp.ok) {
+              const statusData = await statusResp.json();
+              if (statusData.oauth_accounts && statusData.oauth_accounts.length > initialCount) {
+                clearInterval(oauthCheckInterval);
+                oauthCheckInterval = null;
+                showToast("Google account authorized and linked!");
+                closeOAuthModal();
+                renderDashboard(statusData);
+                await fetchModelRoutes();
+              }
+            }
+          } catch (e) {
+            // Polling error ignored
+          }
+        }, 1500);
+
       } catch (err) {
-        showToast(`Init failed: ${err.message}`, "error");
+        showToast(`OAuth init failed: ${err.message}`, "error");
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = "<span>🚀 Sign in with Google (One-Click)</span>";
+        }
       }
+    }
+
+    // Message listener for popup communication
+    window.addEventListener('message', async (event) => {
+      if (event.data && (event.data.type === 'OAUTH_COMPLETE' || event.data.type === 'OAUTH_SUCCESS')) {
+        if (oauthCheckInterval) {
+          clearInterval(oauthCheckInterval);
+          oauthCheckInterval = null;
+        }
+        showToast("Google account authorized and linked!");
+        closeOAuthModal();
+        await fetchGatewayStatus();
+        await fetchModelRoutes();
+      } else if (event.data && event.data.type === 'OAUTH_ERROR') {
+        showToast(`Google Sign-In failed: ${event.data.error}`, "error");
+        const btn = document.getElementById("btnStartGoogleOAuth");
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = "<span>🚀 Sign in with Google (One-Click)</span>";
+        }
+      }
+    });
+
+    async function autoDetectWebAccount() {
+      const btn = document.getElementById("btnAutoDetectWeb");
+      const notice = document.getElementById("webAutoDetectNotice");
+      const label = (document.getElementById("webAccountLabel")?.value || "").trim();
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = "<span>⏳ Scanning for Firefox Gemini Session...</span>";
+      }
+
+      try {
+        const resp = await fetch("/api/web-accounts/auto-detect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label: label, auto_link: true }),
+        });
+        const data = await resp.json();
+
+        if (data.logged_in && data.success) {
+          showToast(data.message || "Web account automatically detected and linked!");
+          closeWebModal();
+          await fetchGatewayStatus();
+          await fetchModelRoutes();
+        } else {
+          if (notice) {
+            notice.style.display = "block";
+            const headingEl = document.getElementById("webNoticeHeading");
+            if (headingEl) headingEl.innerText = "No Active Session Found";
+            const bodyEl = document.getElementById("webNoticeBody");
+            if (bodyEl) {
+              bodyEl.innerText = "Could not find an active Gemini login in Firefox. Click 'Open Gemini in Browser to Sign In', log into Google, then click 'Capture Cookies Now'.";
+            }
+          }
+          showToast("No active Firefox Gemini session found. Please sign in first.", "error");
+        }
+      } catch (err) {
+        showToast(`Auto-detect failed: ${err.message}`, "error");
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = "<span>🌐 1-Click Auto-Detect from Browser / Firefox</span>";
+        }
+      }
+    }
+
+    function openGeminiInBrowser() {
+      window.open("https://gemini.google.com", "_blank");
+      fetch("/api/web-accounts/browser-login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ poll_seconds: 0 }),
+      }).catch(() => {});
     }
 
     async function completeOAuthSubmission() {
@@ -1110,18 +1297,15 @@
         showToast("Please enter the authorization code or URL.", "error");
         return;
       }
-      const accountId = document.getElementById("oauthAccountId").value.trim();
       const label = document.getElementById("oauthAccountLabel").value.trim();
-      const concurrency = parseInt(document.getElementById("oauthConcurrency").value, 10) || 3;
 
       const payload = {
         code: code,
-        account_id: accountId || null,
         label: label,
-        max_concurrency: concurrency,
+        max_concurrency: 3,
         state: currentOAuthSession ? currentOAuthSession.state : null,
         code_verifier: currentOAuthSession ? currentOAuthSession.code_verifier : null,
-        redirect_uri: currentOAuthSession ? currentOAuthSession.redirect_uri : null,
+        redirect_uri: currentOAuthSession ? currentOAuthSession.redirect_uri : `${window.location.origin}/oauth/callback`,
       };
 
       try {
@@ -1134,23 +1318,24 @@
           const errData = await resp.json().catch(() => ({ detail: "Request failed" }));
           throw new Error(errData.detail || "Completion failed");
         }
-        showToast("OAuth account authorized and linked successfully!");
+        showToast("OAuth account authorized and models discovered!");
         closeOAuthModal();
         await fetchGatewayStatus();
+        await fetchModelRoutes();
       } catch (err) {
         showToast(`OAuth failed: ${err.message}`, "error");
       }
     }
 
     async function submitWebAccount() {
-      const accountId = document.getElementById("webAccountId").value.trim();
-      if (!accountId) {
-        showToast("Account ID is required.", "error");
-        return;
-      }
+      let accountId = document.getElementById("webAccountId").value.trim();
       const label = document.getElementById("webAccountLabel").value.trim();
       const concurrency = parseInt(document.getElementById("webConcurrency").value, 10) || 2;
       const method = document.getElementById("webInputMethod").value;
+
+      if (!accountId) {
+        accountId = `web-${Math.random().toString(36).substring(2, 8)}`;
+      }
 
       const payload = {
         account_id: accountId,
@@ -1159,12 +1344,19 @@
       };
 
       if (method === "paste") {
-        payload.cookies = document.getElementById("webCookiesText").value.trim();
+        const cookies = document.getElementById("webCookiesText").value.trim();
+        if (!cookies) {
+          showToast("Please enter cookie string or header.", "error");
+          return;
+        }
+        payload.cookies = cookies;
       } else if (method === "firefox") {
-        payload.firefox_profile_path = document.getElementById("webFirefoxPath").value.trim();
-      } else if (method === "tokens") {
-        payload.secure_1psid = document.getElementById("webPsid").value.trim();
-        payload.secure_1psidts = document.getElementById("webPsidts").value.trim();
+        const ffPath = document.getElementById("webFirefoxPath").value.trim();
+        if (!ffPath) {
+          showToast("Please enter Firefox profile path.", "error");
+          return;
+        }
+        payload.firefox_profile_path = ffPath;
       }
 
       try {
@@ -1177,9 +1369,10 @@
           const errData = await resp.json().catch(() => ({ detail: "Request failed" }));
           throw new Error(errData.detail || "Registration failed");
         }
-        showToast("Web account linked and cookies isolated!");
+        showToast("Web account linked and models discovered!");
         closeWebModal();
         await fetchGatewayStatus();
+        await fetchModelRoutes();
       } catch (err) {
         showToast(`Registration error: ${err.message}`, "error");
       }
@@ -1195,15 +1388,45 @@
         if (!resp.ok) throw new Error(await resp.text());
         showToast(`Account '${accountId}' removed.`);
         await fetchGatewayStatus();
+        await fetchModelRoutes();
       } catch (err) {
         showToast(`Delete failed: ${err.message}`, "error");
       }
     }
 
+    function updateAgentJsonSnippet(models) {
+      const el = document.getElementById("agentJsonSnippet");
+      if (!el) return;
+      const baseApiUrl = `${window.location.origin}/v1`;
+      if (!models || models.length === 0) {
+        el.textContent = JSON.stringify({
+          "provider": "openai-compatible",
+          "base_url": baseApiUrl,
+          "api_key": "sk-gemini-hybrid-pool",
+          "note": "Connect an OAuth or Web account to discover live models"
+        }, null, 2);
+        return;
+      }
+      const mainModel = models[0];
+      const subModel = models[1] || models[0];
+      const fallbackModel = models[2] || models[models.length - 1];
+      el.textContent = JSON.stringify({
+        "provider": "openai-compatible",
+        "base_url": baseApiUrl,
+        "api_key": "sk-gemini-hybrid-pool",
+        "main_agent_model": mainModel,
+        "sub_agent_model": subModel,
+        "fallback_model": fallbackModel,
+        "max_parallel_sub_agents": 8
+      }, null, 2);
+    }
+
     // Render logic
     function renderDashboard(data) {
+      window.lastTelemetry = data;
+
       // 1. KPIs
-      const poolStatus = data.pool_status || "UNKNOWN";
+      const poolStatus = data.pool_status || "EMPTY";
       const cardPool = document.getElementById("cardPoolHealth");
       cardPool.className = "kpi-card";
       if (poolStatus === "HEALTHY") cardPool.classList.add("status-healthy");
@@ -1213,9 +1436,20 @@
       document.getElementById("kpiPoolStatus").textContent = poolStatus;
       document.getElementById("kpiActiveAccounts").textContent = `${data.general_stats.active_accounts} / ${data.general_stats.total_accounts}`;
       document.getElementById("kpiTotalConcurrency").textContent = data.general_stats.total_concurrency;
-      document.getElementById("kpiModelsCount").textContent = data.available_models ? data.available_models.length : 0;
+
+      const modelsCount = (data.available_models && Array.isArray(data.available_models)) ? data.available_models.length : 0;
+      document.getElementById("kpiModelsCount").textContent = modelsCount;
+      const subtitleEl = document.getElementById("kpiModelsSubtitle");
+      if (subtitleEl) {
+        subtitleEl.textContent = modelsCount === 0
+          ? "Add an account to discover models"
+          : "Discovered across cluster";
+      }
+
       document.getElementById("countOAuth").textContent = data.oauth_accounts.length;
       document.getElementById("countWeb").textContent = data.web_accounts.length;
+
+      updateAgentJsonSnippet(data.available_models || []);
 
       // 2. Render OAuth Accounts
       const oauthContainer = document.getElementById("gridOAuthAccounts");
@@ -1377,7 +1611,7 @@
       if (!tbody) return;
       const routes = data.routes || [];
       if (routes.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-dim); padding: 2rem;">No models or routes found.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-dim); padding: 2rem;">No active models or routes in the pool. Link an OAuth CLI or Web Cookie account to discover models.</td></tr>`;
         return;
       }
 

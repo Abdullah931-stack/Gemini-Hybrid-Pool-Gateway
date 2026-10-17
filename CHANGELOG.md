@@ -4,6 +4,36 @@ All notable changes to the **Gemini-Hybrid-Pool-Gateway** (`v3.2` architecture) 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-17
+
+### Added
+
+- **Automated Zero-Copy Browser OAuth Authentication ([`api/dashboard_routes.py`](api/dashboard_routes.py), [`main.py`](main.py), [`static/index.html`](static/index.html)):**
+  - Added `@router.get("/oauth/callback")` endpoint in `api/dashboard_routes.py` with automatic authorization code capture, PKCE challenge completion, live model discovery, and auto-closing success popup with cross-window `postMessage` synchronization.
+  - Added automatic browser launching (`webbrowser.open`) on CLI invocation `python main.py --add-oauth` with an ephemeral loopback HTTP callback listener, removing manual copy-paste of OAuth redirect URLs.
+  - Integrated 1-Click "Sign in with Google" button in the Web Dashboard UI (`static/index.html`) opening a popup OAuth window with real-time account status updates.
+- **Automated Zero-Input Web Cookie Login & Firefox Profile Auto-Detection ([`core/auth_web.py`](core/auth_web.py), [`api/dashboard_routes.py`](api/dashboard_routes.py), [`main.py`](main.py), [`static/index.html`](static/index.html)):**
+  - Implemented `auto_discover_firefox_cookies()` in `core/auth_web.py` auto-detecting Firefox user profiles across Windows (`%APPDATA%/Mozilla/Firefox/Profiles/*.default-release`), Linux, and macOS, with WAL/SHM sidecar synchronization and fallback to `browser_cookie3`.
+  - Added REST endpoints `POST /api/web-accounts/auto-detect` and `POST /api/web-accounts/browser-login` for headless and automated session cookie extraction.
+  - Integrated 1-Click "Auto-Detect Firefox" button in Web Dashboard UI and CLI auto-discovery on `python main.py --add-web --mode auto`.
+- **Test Coverage Expansion ([`tests/test_auth_web.py`](tests/test_auth_web.py), [`tests/test_dashboard_routes.py`](tests/test_dashboard_routes.py), [`tests/test_main_cli.py`](tests/test_main_cli.py), [`tests/test_openai_routes.py`](tests/test_openai_routes.py)):**
+  - Added 18 new unit and integration tests across web auth auto-discovery, OAuth callback workflows, CLI argument combinations, and live model discovery routes.
+  - Total test suite coverage expanded to **386 passing tests** (up from 368 in v0.2.0).
+
+### Fixed
+
+- **CLI Compatibility & Argument Signature Alignment ([`main.py`](main.py)):**
+  - Synchronized CLI argument signatures in `main.py` for `add_oauth` and `add_web` to accept `--label`, `--mode`, `--firefox-profile`, and `--id`, eliminating `TypeError: add_oauth() got an unexpected keyword argument 'mode'`.
+- **Purged Mock & Hardcoded Models from Dashboard and APIs ([`core/model_registry.py`](core/model_registry.py), [`api/dashboard_routes.py`](api/dashboard_routes.py), [`static/index.html`](static/index.html)):**
+  - Removed hardcoded `DEFAULT_STANDARD_MODELS` from `UnifiedModelRegistry.get_base_models()`.
+  - When 0 accounts are registered, `GET /v1/models` and dashboard display `0 Models` and clean `EMPTY` pool status instead of fake placeholder models.
+  - Ensured all models displayed on dashboard and returned via OpenAI API are strictly and 100% discovered from live, registered accounts.
+
+### Changed
+
+- **Production Documentation & Verification ([`README.md`](README.md)):**
+  - Updated test suite badge and verification status to `386 passed`.
+
 ## [0.2.0] - 2026-10-17
 
 ### Added

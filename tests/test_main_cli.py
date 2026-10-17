@@ -63,6 +63,7 @@ def clean_runtime_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("config.settings.ACCOUNTS_FILE_PATH", test_accounts_file)
     monkeypatch.setattr("config.settings.COOKIES_CACHE_DIR", test_cookies_dir)
     monkeypatch.setattr("core.auth_web.COOKIES_CACHE_DIR", test_cookies_dir)
+    monkeypatch.setattr(main, "auto_discover_firefox_cookies", lambda: (None, None))
 
     yield
 
@@ -454,3 +455,169 @@ def test_cli_add_web_wizard_registers_account_with_firefox_profile(
     registered = state_registry.get_web_account("my-firefox-acc")
     assert registered is not None
     assert registered.cookies.secure_1psid == "ff_psid_123"
+
+
+def test_cli_add_oauth_flag_with_label_and_mode(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Top-level --add-oauth flag with --label and --mode must succeed and configure account."""
+    mock_pkce = PKCEChallenge(
+        code_verifier="test_verifier_string_of_sufficient_length_1234567890",
+        code_challenge="test_challenge",
+        state="test_state_123",
+    )
+    mock_credentials = OAuthCredentials(
+        access_token="mock_access_token",
+        project_id="discovered-project-123",
+    )
+
+    monkeypatch.setattr(main, "generate_pkce_pair", lambda: mock_pkce)
+    monkeypatch.setattr(main, "build_authorization_url", lambda **kwargs: "https://mock.auth.url")
+    monkeypatch.setattr(main, "extract_code_from_manual_input", lambda inp, expected_state: "auth_code_xyz")
+    monkeypatch.setattr(main, "complete_oauth_login", AsyncMock(return_value=mock_credentials))
+    monkeypatch.setattr(main, "discover_oauth_models", AsyncMock(return_value=["gemini-2.5-pro"]))
+    monkeypatch.setattr(main, "save_accounts_snapshot", AsyncMock())
+
+    inputs = "\nhttp://localhost:8000/oauth/callback?code=auth_code_xyz&state=test_state_123\n"
+    result = runner.invoke(cli, ["--add-oauth", "--label", "test-label", "--mode", "http_v1internal"], input=inputs)
+
+    assert result.exit_code == 0
+    assert "Successfully registered OAuth account 'test-label'" in result.output
+    registered = state_registry.get_oauth_account("test-label")
+    assert registered is not None
+    assert registered.label == "test-label"
+    assert registered.transport_mode == "http_v1internal"
+
+
+def test_cli_add_oauth_subcommand_with_label_and_mode(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Subcommand add-oauth with --label and --mode must succeed and configure account."""
+    mock_pkce = PKCEChallenge(
+        code_verifier="test_verifier_string_of_sufficient_length_1234567890",
+        code_challenge="test_challenge",
+        state="test_state_123",
+    )
+    mock_credentials = OAuthCredentials(
+        access_token="mock_access_token",
+        project_id="discovered-project-456",
+    )
+
+    monkeypatch.setattr(main, "generate_pkce_pair", lambda: mock_pkce)
+    monkeypatch.setattr(main, "build_authorization_url", lambda **kwargs: "https://mock.auth.url")
+    monkeypatch.setattr(main, "extract_code_from_manual_input", lambda inp, expected_state: "auth_code_xyz")
+    monkeypatch.setattr(main, "complete_oauth_login", AsyncMock(return_value=mock_credentials))
+    monkeypatch.setattr(main, "discover_oauth_models", AsyncMock(return_value=["gemini-2.5-flash"]))
+    monkeypatch.setattr(main, "save_accounts_snapshot", AsyncMock())
+
+    inputs = "\nhttp://localhost:8000/oauth/callback?code=auth_code_xyz&state=test_state_123\n"
+    result = runner.invoke(cli, ["add-oauth", "--label", "test-label", "--mode", "agy_subprocess"], input=inputs)
+
+    assert result.exit_code == 0
+    assert "Successfully registered OAuth account 'test-label'" in result.output
+    registered = state_registry.get_oauth_account("test-label")
+    assert registered is not None
+    assert registered.label == "test-label"
+    assert registered.transport_mode == "agy_subprocess"
+
+
+def test_cli_add_web_flag_with_label_and_firefox_profile(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Top-level --add-web flag with --label and --firefox-profile must bypass cookie prompt."""
+    mock_cookies = WebCookies(secure_1psid="ff_psid_direct", secure_1psidts="ff_psidts_direct")
+    monkeypatch.setattr(main, "extract_firefox_cookies", lambda path: mock_cookies)
+    monkeypatch.setattr(main, "save_accounts_snapshot", AsyncMock())
+
+    inputs = "\n"
+    result = runner.invoke(cli, ["--add-web", "--label", "test-web", "--firefox-profile", "dummy"], input=inputs)
+
+    assert result.exit_code == 0
+    assert "Successfully registered Web account 'test-web'" in result.output
+    registered = state_registry.get_web_account("test-web")
+    assert registered is not None
+    assert registered.label == "test-web"
+    assert registered.cookies.secure_1psid == "ff_psid_direct"
+    assert registered.cookies.secure_1psidts == "ff_psidts_direct"
+
+
+def test_cli_add_web_subcommand_with_label_and_firefox_profile(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Subcommand add-web with --label and --firefox-profile must bypass cookie prompt."""
+    mock_cookies = WebCookies(secure_1psid="ff_psid_sub", secure_1psidts="ff_psidts_sub")
+    monkeypatch.setattr(main, "extract_firefox_cookies", lambda path: mock_cookies)
+    monkeypatch.setattr(main, "save_accounts_snapshot", AsyncMock())
+
+    inputs = "\n"
+    result = runner.invoke(cli, ["add-web", "--label", "test-web-sub", "--firefox-profile", "dummy"], input=inputs)
+
+    assert result.exit_code == 0
+    assert "Successfully registered Web account 'test-web-sub'" in result.output
+    registered = state_registry.get_web_account("test-web-sub")
+    assert registered is not None
+    assert registered.label == "test-web-sub"
+    assert registered.cookies.secure_1psid == "ff_psid_sub"
+
+
+def test_cli_add_web_auto_detect_from_firefox_profile(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """add-web without profile must auto-detect Firefox cookies and register without prompts."""
+    mock_cookies = WebCookies(secure_1psid="auto_psid_zero_input", secure_1psidts="auto_ts_zero_input")
+    monkeypatch.setattr(main, "auto_discover_firefox_cookies", lambda: (Path("fake/cookies.sqlite"), mock_cookies))
+    monkeypatch.setattr(main, "save_accounts_snapshot", AsyncMock())
+
+    result = runner.invoke(cli, ["add-web", "--id", "zero-copy-web"])
+
+    assert result.exit_code == 0
+    assert "Automatically detected Gemini cookies from Firefox" in result.output
+    assert "Successfully registered Web account 'zero-copy-web'" in result.output
+    registered = state_registry.get_web_account("zero-copy-web")
+    assert registered is not None
+    assert registered.cookies.secure_1psid == "auto_psid_zero_input"
+
+
+def test_cli_add_oauth_automatic_callback_success(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """add-oauth in interactive mode must capture code via OAuthCallbackServer without manual paste."""
+    mock_pkce = PKCEChallenge(
+        code_verifier="test_verifier_string_of_sufficient_length_1234567890",
+        code_challenge="test_challenge",
+        state="test_state_123",
+    )
+    mock_credentials = OAuthCredentials(
+        access_token="mock_access_token_auto",
+        project_id="auto-discovered-proj",
+    )
+
+    monkeypatch.setattr(main, "generate_pkce_pair", lambda: mock_pkce)
+    monkeypatch.setattr(main, "build_authorization_url", lambda **kwargs: "https://mock.auth.url")
+    monkeypatch.setattr(main, "complete_oauth_login", AsyncMock(return_value=mock_credentials))
+    monkeypatch.setattr(main, "discover_oauth_models", AsyncMock(return_value=["gemini-3.8-flash"]))
+    monkeypatch.setattr(main, "_is_interactive_terminal", lambda: True)
+
+    with patch("webbrowser.open") as mock_browser, \
+         patch.object(main.OAuthCallbackServer, "start", new_callable=AsyncMock) as mock_start, \
+         patch.object(main.OAuthCallbackServer, "wait_for_code", new_callable=AsyncMock) as mock_wait:
+        mock_start.return_value = 8000
+        mock_wait.return_value = "auto_captured_code_789"
+
+        result = runner.invoke(cli, ["add-oauth", "--id", "auto-oauth-zero-copy"])
+
+        assert result.exit_code == 0
+        assert "Opening Google authorization page in your browser" in result.output
+        assert "Successfully registered OAuth account 'auto-oauth-zero-copy'" in result.output
+        mock_browser.assert_called_once_with("https://mock.auth.url")
+        registered = state_registry.get_oauth_account("auto-oauth-zero-copy")
+        assert registered is not None
+        assert registered.credentials.project_id == "auto-discovered-proj"
+
+

@@ -379,10 +379,14 @@ def test_unified_model_registry_aggregation() -> None:
 
     assert "gemini-custom-pro" in base_models
     assert "gemini-web-exclusive" in base_models
-    assert "gemini-banned-model" not in base_models
-    # Defaults should be present
-    assert "gemini-2.5-pro" in base_models
-    assert "gemini-4-argon" in base_models
+    # Pure discovered models: defaults are NOT included by default
+    assert "gemini-2.5-pro" not in base_models
+    assert "gemini-4-argon" not in base_models
+
+    # When include_defaults=True, defaults are included
+    base_models_with_defaults = model_registry.get_base_models(include_defaults=True)
+    assert "gemini-2.5-pro" in base_models_with_defaults
+    assert "gemini-4-argon" in base_models_with_defaults
 
     all_ids = model_registry.get_all_model_ids()
     assert "gemini-custom-pro-minimal" in all_ids

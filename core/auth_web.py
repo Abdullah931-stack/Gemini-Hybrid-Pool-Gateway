@@ -293,6 +293,109 @@ def extract_firefox_cookies(
     )
 
 
+def auto_discover_firefox_cookies(
+    domain_name: str = DEFAULT_GOOGLE_COOKIE_DOMAIN,
+) -> tuple[Path | None, WebCookies | None]:
+    """Automatically discover Firefox profile and extract active Google session cookies.
+
+    Inspects standard platform Firefox profile directories:
+    - Windows: %APPDATA%/Mozilla/Firefox/Profiles/*.default-release and *.default
+    - Linux: ~/.mozilla/firefox/*.default-release, ~/.mozilla/firefox/*.default, Snap & Flatpak
+    - macOS: ~/Library/Application Support/Firefox/Profiles/*.default-release and *.default
+
+    Attempts extraction via isolated SQLite reading first (prioritizing most recently
+    modified profile databases). If no profile is found or cookies are absent, falls
+    back to querying browser_cookie3.firefox(domain_name="google.com").
+
+    Returns:
+        tuple[Path | None, WebCookies | None]: (profile_sqlite_path, WebCookies) if
+        found, or (None, None) if no active session cookies could be discovered.
+    """
+    search_dirs: list[Path] = []
+    # 1. Windows AppData
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        search_dirs.append(Path(appdata) / "Mozilla" / "Firefox" / "Profiles")
+    search_dirs.append(Path.home() / "AppData" / "Roaming" / "Mozilla" / "Firefox" / "Profiles")
+
+    # 2. Linux / Unix
+    search_dirs.append(Path.home() / ".mozilla" / "firefox")
+    search_dirs.append(Path.home() / "snap" / "firefox" / "common" / ".mozilla" / "firefox")
+    search_dirs.append(Path.home() / ".var" / "app" / "org.mozilla.firefox" / ".mozilla" / "firefox")
+
+    # 3. macOS
+    search_dirs.append(Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles")
+
+    candidate_profiles: list[Path] = []
+    seen_paths: set[str] = set()
+
+    for base_dir in search_dirs:
+        try:
+            if not base_dir.exists() or not base_dir.is_dir():
+                continue
+            for entry in base_dir.iterdir():
+                try:
+                    if entry.is_dir():
+                        sqlite_candidate = entry / "cookies.sqlite"
+                        if sqlite_candidate.exists() and sqlite_candidate.is_file():
+                            canonical = str(sqlite_candidate.resolve())
+                            if canonical not in seen_paths:
+                                seen_paths.add(canonical)
+                                candidate_profiles.append(sqlite_candidate)
+                except (PermissionError, OSError):
+                    continue
+        except (PermissionError, OSError):
+            continue
+
+    def _profile_priority(sqlite_path: Path) -> tuple[int, float]:
+        folder_name = sqlite_path.parent.name.lower()
+        # Rank: 0 for .default-release, 1 for .default, 2 for other
+        tier = 2
+        if ".default-release" in folder_name:
+            tier = 0
+        elif ".default" in folder_name:
+            tier = 1
+        try:
+            mtime = sqlite_path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (tier, -mtime)
+
+    candidate_profiles.sort(key=_profile_priority)
+
+    # Try extraction from candidate profiles
+    for sqlite_file in candidate_profiles:
+        try:
+            cookies = extract_firefox_cookies(sqlite_file, domain_name=domain_name)
+            if cookies and cookies.secure_1psid:
+                logger.info("Discovered active Firefox session cookies from: %s", sqlite_file)
+                return (sqlite_file, cookies)
+        except Exception as exc:
+            logger.debug("Candidate profile '%s' did not have valid session cookies: %s", sqlite_file, exc)
+
+    # Fallback to browser_cookie3 directly
+    if browser_cookie3 is not None:
+        try:
+            extracted: dict[str, str] = {}
+            normalized_domain = domain_name.lstrip(".")
+            cookie_jar = browser_cookie3.firefox(domain_name=normalized_domain)
+            for c in cookie_jar:
+                if c.name in (SECURE_1PSID_COOKIE_NAME, SECURE_1PSIDTS_COOKIE_NAME):
+                    if c.value and c.name not in extracted:
+                        extracted[c.name] = str(c.value).strip()
+
+            psid = extracted.get(SECURE_1PSID_COOKIE_NAME, "")
+            if psid:
+                ts = extracted.get(SECURE_1PSIDTS_COOKIE_NAME, "")
+                logger.info("Discovered active Google session cookies via browser_cookie3.firefox")
+                return (None, WebCookies(secure_1psid=psid, secure_1psidts=ts))
+        except Exception as exc:
+            logger.debug("browser_cookie3.firefox auto-discovery attempt failed: %s", exc)
+
+    return (None, None)
+
+
+
 def _clean_cookie_token(raw_token: str, prefix_key: str) -> str:
     """Strip surrounding whitespace, quotes, optional prefix, and semicolons."""
     cleaned = raw_token.strip()

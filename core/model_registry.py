@@ -715,12 +715,12 @@ def _account_supports_base_model(
     discovered_models: list[str],
     base_model: str,
 ) -> bool:
-    """Return True if ``discovered_models`` matches ``base_model`` (or is unpopulated)."""
-    if not discovered_models:
-        return True
-    normalized_target, _ = split_model_effort_suffix(base_model)
+    """Return True if ``discovered_models`` matches ``base_model``."""
+    if not discovered_models or not base_model:
+        return False
+    normalized_target, _ = split_model_effort_suffix(normalize_model_id(base_model))
     for candidate in discovered_models:
-        cand_base, _ = split_model_effort_suffix(candidate)
+        cand_base, _ = split_model_effort_suffix(normalize_model_id(candidate))
         if cand_base == normalized_target:
             return True
     return False
@@ -734,19 +734,20 @@ class UnifiedModelRegistry:
             registry if registry is not None else state_registry
         )
 
-    def get_base_models(self) -> list[str]:
-        """Return ordered unique base model names across defaults and active accounts."""
+    def get_base_models(self, include_defaults: bool = False) -> list[str]:
+        """Return ordered unique base model names across active accounts (and optional defaults)."""
         models: list[str] = []
-        for default_model in DEFAULT_STANDARD_MODELS:
-            norm_default, _ = split_model_effort_suffix(default_model)
-            if norm_default and norm_default not in models:
-                models.append(norm_default)
+        if include_defaults:
+            for default_model in DEFAULT_STANDARD_MODELS:
+                norm_default, _ = split_model_effort_suffix(normalize_model_id(default_model))
+                if norm_default and norm_default not in models:
+                    models.append(norm_default)
 
         for oauth_acc in self._registry.oauth_accounts:
             if oauth_acc.status == "SUSPENDED":
                 continue
             for discovered in oauth_acc.discovered_models:
-                base_name, _ = split_model_effort_suffix(discovered)
+                base_name, _ = split_model_effort_suffix(normalize_model_id(discovered))
                 if base_name and base_name not in models:
                     models.append(base_name)
 
@@ -754,15 +755,22 @@ class UnifiedModelRegistry:
             if web_acc.status == "SUSPENDED":
                 continue
             for discovered in web_acc.discovered_models:
-                base_name, _ = split_model_effort_suffix(discovered)
+                base_name, _ = split_model_effort_suffix(normalize_model_id(discovered))
                 if base_name and base_name not in models:
                     models.append(base_name)
 
         return models
 
-    def get_all_model_ids(self, *, include_effort_variants: bool = True) -> list[str]:
+    def get_all_model_ids(
+        self,
+        *,
+        include_effort_variants: bool = True,
+        include_defaults: bool = False,
+    ) -> list[str]:
         """Return all base model IDs plus reasoning effort suffix variants."""
-        base_models = self.get_base_models()
+        base_models = self.get_base_models(include_defaults=include_defaults)
+        if not base_models:
+            return []
         if not include_effort_variants:
             return base_models
 
@@ -776,8 +784,17 @@ class UnifiedModelRegistry:
                     all_ids.append(variant)
         return all_ids
 
-    def list_openai_models(self) -> dict[str, Any]:
+    def list_openai_models(self, *, include_defaults: bool = False) -> dict[str, Any]:
         """Return an OpenAI-compatible ``GET /v1/models`` response dictionary."""
+        all_ids = self.get_all_model_ids(
+            include_effort_variants=True,
+            include_defaults=include_defaults,
+        )
+        if not all_ids:
+            return {
+                "object": "list",
+                "data": [],
+            }
         model_entries = [
             {
                 "id": model_id,
@@ -785,7 +802,7 @@ class UnifiedModelRegistry:
                 "created": 1735689600,
                 "owned_by": "google-hybrid-pool",
             }
-            for model_id in self.get_all_model_ids(include_effort_variants=True)
+            for model_id in all_ids
         ]
         return {
             "object": "list",

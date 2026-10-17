@@ -3,7 +3,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg)](https://fastapi.tiangolo.com/)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI%20v1%20Compatible-orange.svg)](https://platform.openai.com/docs/api-reference)
-[![Tests Passing](https://img.shields.io/badge/tests-368%20passed-brightgreen.svg)](tests/)
+[![Tests Passing](https://img.shields.io/badge/tests-386%20passed-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Gemini Hybrid Pool Gateway** is a high-concurrency, fault-tolerant proxy gateway that pools **Google Cloud Code Assist (OAuth CLI Pool)** and **Gemini Web (Cookie Pool)** accounts into a single, unified, OpenAI-compatible HTTP interface (`/v1/chat/completions`, `/v1/models`).
@@ -850,7 +850,7 @@ pytest tests/test_model_routing_dynamic.py # Dynamic model routing, persistence,
 
 **Test Verification Status**:
 ```text
-============================== 368 passed in ~13s ==============================
+============================== 386 passed in ~12s ==============================
 ```
 
 ---

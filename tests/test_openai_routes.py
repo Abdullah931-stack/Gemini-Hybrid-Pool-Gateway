@@ -41,7 +41,7 @@ from api.openai_routes import (
     get_model_registry,
     router as openai_router,
 )
-from config.settings import OAuthAccount, OAuthCredentials
+from config.settings import OAuthAccount, OAuthCredentials, state_registry
 from core.failover import (
     FailoverController,
     ModelNotSupportedError,
@@ -53,6 +53,14 @@ from core.model_registry import UnifiedModelRegistry
 # ============================================================================
 # Test Doubles & Fixtures
 # ============================================================================
+
+
+@pytest.fixture(autouse=True)
+def clean_state() -> Any:
+    """Ensure clean registry state between tests."""
+    state_registry.reset()
+    yield
+    state_registry.reset()
 
 
 class StubFailoverController:
@@ -193,10 +201,31 @@ def client_factory(app: FastAPI) -> Callable[[], httpx.AsyncClient]:
 
 
 @pytest.mark.asyncio
+async def test_list_models_empty_pool_returns_empty_list(
+    client_factory: Callable[[], httpx.AsyncClient],
+) -> None:
+    """GET /v1/models must return empty list when no accounts are registered."""
+    async with client_factory() as client:
+        response = await client.get("/v1/models")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object"] == "list"
+    assert payload["data"] == []
+
+
+@pytest.mark.asyncio
 async def test_list_models_returns_openai_compliant_catalog(
     client_factory: Callable[[], httpx.AsyncClient],
 ) -> None:
-    """GET /v1/models must return a list object containing model entries."""
+    """GET /v1/models must return a list object containing discovered model entries."""
+    test_acc = OAuthAccount(
+        id="test-discovered-account",
+        status="ACTIVE",
+        credentials=OAuthCredentials(access_token="tok"),
+        discovered_models=["gemini-2.5-pro"],
+    )
+    state_registry.upsert_oauth_account(test_acc)
+
     async with client_factory() as client:
         response = await client.get("/v1/models")
     assert response.status_code == 200
@@ -222,6 +251,14 @@ async def test_get_model_existing_returns_metadata(
     client_factory: Callable[[], httpx.AsyncClient],
 ) -> None:
     """GET /v1/models/{model_id} must return metadata for a known model."""
+    test_acc = OAuthAccount(
+        id="test-discovered-account",
+        status="ACTIVE",
+        credentials=OAuthCredentials(access_token="tok"),
+        discovered_models=["gemini-2.5-pro"],
+    )
+    state_registry.upsert_oauth_account(test_acc)
+
     async with client_factory() as client:
         response = await client.get("/v1/models/gemini-2.5-pro")
     assert response.status_code == 200

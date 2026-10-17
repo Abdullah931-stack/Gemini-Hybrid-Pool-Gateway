@@ -278,7 +278,27 @@ async def test_gate6_openai_models_catalog_and_thinking_suffixes(
 ):
     """Gate 6.2.1: Verify GET /v1/models catalog listing and reasoning effort suffixes."""
     async with client_factory() as client:
-        # 1. Catalog listing
+        # 0. Initial empty pool verification
+        initial_res = await client.get("/v1/models")
+        assert initial_res.status_code == 200
+        assert initial_res.json() == {"object": "list", "data": []}
+
+        # Seed registered accounts with discovered models
+        oauth_seed = OAuthAccount(
+            id="gate6-seed-oauth",
+            status="ACTIVE",
+            credentials=OAuthCredentials(access_token="tok-gate6"),
+            discovered_models=["gemini-2.5-pro", "gemini-3.8-flash", "gemini-3.1-flash-lite"],
+        )
+        web_seed = WebAccount(
+            id="gate6-seed-web",
+            status="ACTIVE",
+            discovered_models=["gemini-4-argon"],
+        )
+        state_registry.upsert_oauth_account(oauth_seed)
+        state_registry.upsert_web_account(web_seed)
+
+        # 1. Catalog listing with discovered models
         response = await client.get("/v1/models")
         assert response.status_code == 200
         catalog = response.json()

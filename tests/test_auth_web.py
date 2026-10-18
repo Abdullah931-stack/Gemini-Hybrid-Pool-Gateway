@@ -68,6 +68,8 @@ from core.auth_web import (
     reject_chromium_cookie_source,
     sanitize_shared_cookie_env,
     save_account_cookies_isolated,
+    login_web_via_isolated_firefox,
+    _read_moz_cookies_with_temp_fallback,
 )
 
 
@@ -88,45 +90,15 @@ def create_mock_firefox_sqlite(
     conn = sqlite3.connect(str(db_path))
     with conn:
         if include_last_accessed:
-            conn.execute(
-                """
-                CREATE TABLE moz_cookies (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT,
-                    value TEXT,
-                    host TEXT,
-                    lastAccessed INTEGER
-                )
-                """
-            )
-            conn.execute(
-                "INSERT INTO moz_cookies (name, value, host, lastAccessed) VALUES (?, ?, ?, ?)",
-                (SECURE_1PSID_COOKIE_NAME, psid, domain, 1700000000),
-            )
+            conn.execute("CREATE TABLE moz_cookies (id INTEGER PRIMARY KEY, name TEXT, value TEXT, host TEXT, lastAccessed INTEGER)")
+            conn.execute("INSERT INTO moz_cookies (name, value, host, lastAccessed) VALUES (?, ?, ?, ?)", (SECURE_1PSID_COOKIE_NAME, psid, domain, 1700000000))
             if psidts:
-                conn.execute(
-                    "INSERT INTO moz_cookies (name, value, host, lastAccessed) VALUES (?, ?, ?, ?)",
-                    (SECURE_1PSIDTS_COOKIE_NAME, psidts, domain, 1700000001),
-                )
+                conn.execute("INSERT INTO moz_cookies (name, value, host, lastAccessed) VALUES (?, ?, ?, ?)", (SECURE_1PSIDTS_COOKIE_NAME, psidts, domain, 1700000001))
         else:
-            conn.execute(
-                """
-                CREATE TABLE moz_cookies (
-                    name TEXT,
-                    value TEXT,
-                    host TEXT
-                )
-                """
-            )
-            conn.execute(
-                "INSERT INTO moz_cookies (name, value, host) VALUES (?, ?, ?)",
-                (SECURE_1PSID_COOKIE_NAME, psid, domain),
-            )
+            conn.execute("CREATE TABLE moz_cookies (name TEXT, value TEXT, host TEXT)")
+            conn.execute("INSERT INTO moz_cookies (name, value, host) VALUES (?, ?, ?)", (SECURE_1PSID_COOKIE_NAME, psid, domain))
             if psidts:
-                conn.execute(
-                    "INSERT INTO moz_cookies (name, value, host) VALUES (?, ?, ?)",
-                    (SECURE_1PSIDTS_COOKIE_NAME, psidts, domain),
-                )
+                conn.execute("INSERT INTO moz_cookies (name, value, host) VALUES (?, ?, ?)", (SECURE_1PSIDTS_COOKIE_NAME, psidts, domain))
     conn.close()
     return db_path
 
@@ -676,4 +648,107 @@ def test_auto_discover_firefox_cookies_returns_none_when_empty(
     path, cookies = auto_discover_firefox_cookies()
     assert path is None
     assert cookies is None
+
+
+@pytest.mark.asyncio
+async def test_session_manager_close_client(tmp_path: Path) -> None:
+    """Verify WebSessionManager.close_client closes client and flushes cookies."""
+    cache_dir = tmp_path / "cookies_cache"
+    account = WebAccount(
+        id="acc_close_test",
+        label="Close Account",
+        cookies=WebCookies(secure_1psid="init_psid", secure_1psidts="init_ts"),
+    )
+    manager = WebSessionManager(
+        cache_dir=cache_dir, sync_snapshot=False, client_factory=FakeMockGeminiClient
+    )
+    client = await manager.get_or_init_client(account)
+    assert manager.get_client(account.id) is client
+
+    closed = await manager.close_client(account)
+    assert closed is True
+    assert client.close_calls == 1
+    assert manager.get_client(account.id) is None
+    assert await manager.close_client(account) is False
+
+    client2 = await manager.get_or_init_client(account)
+    assert await manager.close_client(account.id) is True
+    assert client2.close_calls == 1
+    assert manager.get_client(account.id) is None
+
+
+@pytest.mark.asyncio
+async def test_session_manager_close_all(tmp_path: Path) -> None:
+    """Verify WebSessionManager.close_all closes all managed clients."""
+    cache_dir = tmp_path / "cookies_cache"
+    manager = WebSessionManager(
+        cache_dir=cache_dir, sync_snapshot=False, client_factory=FakeMockGeminiClient
+    )
+    clients: list[FakeMockGeminiClient] = []
+    for i in range(3):
+        acc = WebAccount(
+            id=f"acc_all_{i}",
+            label=f"Acc {i}",
+            cookies=WebCookies(secure_1psid=f"psid_{i}"),
+        )
+        cl = await manager.get_or_init_client(acc)
+        clients.append(cl)
+
+    assert len(manager._clients) == 3
+    await manager.close_all()
+    assert len(manager._clients) == 0
+    assert all(cl.close_calls == 1 for cl in clients)
+
+
+def test_read_moz_cookies_with_temp_fallback_wal(tmp_path: Path) -> None:
+    """Verify WAL and SHM sidecars are copied and read in _read_moz_cookies_with_temp_fallback."""
+    db_file = tmp_path / "cookies.sqlite"
+    conn = sqlite3.connect(str(db_file))
+    with conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE moz_cookies (name TEXT, value TEXT, host TEXT, lastAccessed INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO moz_cookies VALUES (?, ?, ?, ?)",
+            (SECURE_1PSID_COOKIE_NAME, "wal_psid_val", ".google.com", 100),
+        )
+        conn.execute(
+            "INSERT INTO moz_cookies VALUES (?, ?, ?, ?)",
+            (SECURE_1PSIDTS_COOKIE_NAME, "wal_ts_val", ".google.com", 200),
+        )
+    wal_file = tmp_path / "cookies.sqlite-wal"
+    shm_file = tmp_path / "cookies.sqlite-shm"
+    if not wal_file.exists():
+        wal_file.write_bytes(b"dummy_wal_header")
+    if not shm_file.exists():
+        shm_file.write_bytes(b"dummy_shm_header")
+
+    cookies = _read_moz_cookies_with_temp_fallback(db_file, ".google.com")
+    assert cookies[SECURE_1PSID_COOKIE_NAME] == "wal_psid_val"
+    assert cookies[SECURE_1PSIDTS_COOKIE_NAME] == "wal_ts_val"
+
+    extracted = extract_firefox_cookies(db_file)
+    assert extracted.secure_1psid == "wal_psid_val"
+    assert extracted.secure_1psidts == "wal_ts_val"
+
+
+@pytest.mark.asyncio
+async def test_login_web_via_isolated_firefox_harvest() -> None:
+    """Verify login_web_via_isolated_firefox delegates to harvest_gemini_cookies_via_isolated_firefox."""
+    from unittest.mock import AsyncMock, patch
+
+    expected = WebCookies(secure_1psid="harvest_psid", secure_1psidts="harvest_ts")
+    with patch(
+        "core.firefox_launcher.harvest_gemini_cookies_via_isolated_firefox",
+        new_callable=AsyncMock,
+    ) as mock_harvest:
+        mock_harvest.return_value = expected
+        result = await login_web_via_isolated_firefox(timeout_seconds=45.0)
+        mock_harvest.assert_awaited_once_with(
+            timeout_seconds=45.0,
+            domain_name=DEFAULT_GOOGLE_COOKIE_DOMAIN,
+        )
+        assert result == expected
+
 

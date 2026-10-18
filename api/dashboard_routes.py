@@ -12,6 +12,7 @@ Implements Level 5 (Control Plane & Dashboard) of Gemini-Hybrid-Pool-Gateway:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 import re
@@ -60,7 +61,12 @@ from core.hybrid_scheduler import (
     calculate_web_concurrency_denominator,
     get_model_channel_preference,
 )
-from core.model_registry import discover_oauth_models, unified_model_registry
+from core.firefox_launcher import IsolatedFirefoxSession
+from core.model_registry import (
+    DEFAULT_OAUTH_MODELS,
+    discover_oauth_models,
+    unified_model_registry,
+)
 from core.usage_monitor import sync_all_registered_accounts
 
 logger = logging.getLogger(__name__)
@@ -73,6 +79,7 @@ INDEX_HTML_PATH: Path = STATIC_DIR / "index.html"
 _SAFE_ACCOUNT_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
 
 _pending_oauth_sessions: dict[str, dict[str, Any]] = {}
+_pending_oauth_events: dict[str, asyncio.Event] = {}
 _PENDING_SESSION_TTL_SECONDS: float = 3600.0
 
 
@@ -92,6 +99,7 @@ class OAuthInitRequest(BaseModel):
     label: str = ""
     max_concurrency: int = Field(default=3, ge=1, le=10)
     concurrency: int | None = Field(default=None)
+    open_browser: bool = True
 
 
 class OAuthInitResponse(BaseModel):
@@ -148,14 +156,14 @@ class WebAutoDetectRequest(BaseModel):
 
 
 class WebBrowserLoginRequest(BaseModel):
-    """Payload for opening browser to gemini.google.com and optional polling."""
+    """Payload for opening isolated Firefox to gemini.google.com and harvesting cookies."""
 
     model_config = ConfigDict(populate_by_name=True)
 
     account_id: str | None = None
     label: str = ""
     max_concurrency: int = Field(default=2, ge=1, le=8)
-    poll_seconds: float = Field(default=0.0, ge=0.0, le=60.0)
+    poll_seconds: float = Field(default=180.0, ge=0.0, le=600.0)
 
 
 class ModelRouteUpdateRequest(BaseModel):
@@ -184,6 +192,9 @@ def _prune_expired_oauth_sessions(now: float) -> None:
     ]
     for key in expired_keys:
         _pending_oauth_sessions.pop(key, None)
+        ev = _pending_oauth_events.pop(key, None)
+        if ev:
+            ev.set()
 
 
 def _store_pending_oauth_session(
@@ -353,7 +364,7 @@ async def _discover_models_for_new_oauth(account: OAuthAccount) -> list[str]:
     except Exception as exc:
         logger.warning("Dynamic model discovery skipped for %s: %s", account.id, exc)
 
-    return []
+    return list(DEFAULT_OAUTH_MODELS)
 
 
 # ============================================================================
@@ -394,6 +405,25 @@ async def get_gateway_status() -> dict[str, Any]:
     }
 
 
+async def _launch_isolated_oauth_browser(auth_url: str, event: asyncio.Event) -> None:
+    """Launch isolated Firefox for OAuth flow and wait for callback event or user exit."""
+    try:
+        session = IsolatedFirefoxSession(target_url=auth_url)
+        try:
+            while not event.is_set():
+                if session.proc and session.proc.poll() is not None:
+                    break
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=0.5)
+                except (asyncio.TimeoutError, TimeoutError):
+                    continue
+        finally:
+            if hasattr(session, "close_and_cleanup"):
+                session.close_and_cleanup()
+    except Exception as exc:
+        logger.warning("Isolated Firefox OAuth session exited: %s", exc)
+
+
 @router.post("/oauth-accounts/init", response_model=OAuthInitResponse)
 async def init_oauth_account(payload: OAuthInitRequest | None = None) -> OAuthInitResponse:
     """Generate PKCE challenge and return Google authorization URL."""
@@ -418,6 +448,11 @@ async def init_oauth_account(payload: OAuthInitRequest | None = None) -> OAuthIn
         concurrency=effective_concurrency,
     )
 
+    if req.open_browser:
+        event = asyncio.Event()
+        _pending_oauth_events[pkce.state] = event
+        asyncio.create_task(_launch_isolated_oauth_browser(auth_url, event))
+
     return OAuthInitResponse(
         auth_url=auth_url,
         state=pkce.state,
@@ -435,6 +470,10 @@ async def complete_oauth_account(payload: OAuthCompleteRequest) -> dict[str, Any
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Code cannot be empty.")
 
     saved_session = _pending_oauth_sessions.pop(payload.state, {}) if payload.state else {}
+    if payload.state:
+        oauth_event = _pending_oauth_events.pop(payload.state, None)
+        if oauth_event is not None:
+            oauth_event.set()
     code_verifier = (payload.code_verifier or saved_session.get("code_verifier") or "").strip()
     if not code_verifier:
         raise HTTPException(
@@ -527,6 +566,10 @@ if (window.opener) {{
         )
 
     saved_session = _pending_oauth_sessions.pop(state, {}) if state else {}
+    if state:
+        oauth_event = _pending_oauth_events.pop(state, None)
+        if oauth_event is not None:
+            oauth_event.set()
     code_verifier = (saved_session.get("code_verifier") or "").strip()
     redirect_uri = (saved_session.get("redirect_uri") or "http://localhost:8000/oauth/callback").strip()
     client_id = saved_session.get("client_id")
@@ -536,6 +579,9 @@ if (window.opener) {{
     if not code_verifier and not state and len(_pending_oauth_sessions) == 1:
         first_key = next(iter(_pending_oauth_sessions))
         fallback_session = _pending_oauth_sessions.pop(first_key)
+        ev = _pending_oauth_events.pop(first_key, None)
+        if ev is not None:
+            ev.set()
         code_verifier = fallback_session.get("code_verifier", "")
         redirect_uri = fallback_session.get("redirect_uri", redirect_uri)
         client_id = fallback_session.get("client_id", client_id)
@@ -662,6 +708,37 @@ async def delete_oauth_account(account_id: str) -> dict[str, Any]:
     return {"success": True, "message": f"OAuth account '{validated_id}' deleted successfully."}
 
 
+async def _initialize_and_discover_web_account(account: WebAccount) -> list[str]:
+    """Initialize Web client, synchronize quota usage, and discover supported models."""
+    from core.auth_web import default_web_session_manager
+    from core.model_registry import discover_web_models
+    from core.usage_monitor import sync_web_account_usage
+
+    try:
+        client = await default_web_session_manager.get_or_init_client(account)
+        await sync_web_account_usage(account, client=client, persist=False)
+        discovered = await discover_web_models(account, client)
+        if discovered:
+            account.discovered_models = discovered
+        elif not account.discovered_models:
+            account.discovered_models = [
+                "gemini-4-argon",
+                "gemini-3.1-pro",
+                "gemini-3.8-flash",
+                "gemini-3.1-flash-lite",
+            ]
+    except Exception as exc:
+        logger.warning("Web account setup or model discovery skipped: %s", exc)
+        if not account.discovered_models:
+            account.discovered_models = [
+                "gemini-4-argon",
+                "gemini-3.1-pro",
+                "gemini-3.8-flash",
+                "gemini-3.1-flash-lite",
+            ]
+    return account.discovered_models
+
+
 @router.post("/web-accounts/add")
 async def add_web_account(payload: WebAccountAddRequest) -> dict[str, Any]:
     """Add a Web Cookie pool account, save isolated cookies file, and persist snapshot."""
@@ -683,20 +760,7 @@ async def add_web_account(payload: WebAccountAddRequest) -> dict[str, Any]:
 
     save_account_cookies_isolated(account, sync_snapshot=False)
     state_registry.upsert_web_account(account)
-
-    try:
-        from core.auth_web import default_web_session_manager
-        from core.model_registry import discover_web_models
-        from core.usage_monitor import sync_web_account_usage
-        await sync_web_account_usage(account, session_manager=default_web_session_manager)
-        client = await default_web_session_manager.get_client(account)
-        if client is not None:
-            discovered = await discover_web_models(account, client)
-            if discovered:
-                account.discovered_models = discovered
-    except Exception as exc:
-        logger.warning("Web account setup or model discovery skipped for %s: %s", validated_id, exc)
-
+    await _initialize_and_discover_web_account(account)
     await save_accounts_snapshot()
 
     return {
@@ -714,12 +778,6 @@ async def auto_detect_web_account(payload: WebAutoDetectRequest | None = None) -
     sqlite_path, cookies = auto_discover_firefox_cookies()
 
     if not cookies or not cookies.secure_1psid:
-        if req.open_browser_if_missing:
-            try:
-                import webbrowser
-                webbrowser.open("https://gemini.google.com")
-            except Exception as exc:
-                logger.warning("Failed to open browser: %s", exc)
         return {
             "success": False,
             "logged_in": False,
@@ -751,30 +809,12 @@ async def auto_detect_web_account(payload: WebAutoDetectRequest | None = None) -
         cookie_file=str(cookie_file_path),
         cookies=cookies,
         status="ACTIVE",
-        discovered_models=[
-            "gemini-4-argon",
-            "gemini-3.1-pro",
-            "gemini-3.8-flash",
-            "gemini-3.1-flash-lite",
-        ],
+        discovered_models=[],
     )
 
     save_account_cookies_isolated(account, sync_snapshot=False)
     state_registry.upsert_web_account(account)
-
-    try:
-        from core.auth_web import default_web_session_manager
-        from core.model_registry import discover_web_models
-        from core.usage_monitor import sync_web_account_usage
-        await sync_web_account_usage(account, session_manager=default_web_session_manager)
-        client = await default_web_session_manager.get_client(account)
-        if client is not None:
-            discovered = await discover_web_models(account, client)
-            if discovered:
-                account.discovered_models = discovered
-    except Exception as exc:
-        logger.warning("Auto-detected web account discovery warning: %s", exc)
-
+    await _initialize_and_discover_web_account(account)
     await save_accounts_snapshot()
 
     return {
@@ -790,36 +830,51 @@ async def auto_detect_web_account(payload: WebAutoDetectRequest | None = None) -
 
 @router.post("/web-accounts/browser-login")
 async def trigger_web_browser_login(payload: WebBrowserLoginRequest | None = None) -> dict[str, Any]:
-    """Open https://gemini.google.com in browser and optionally poll for cookies."""
+    """Launch isolated Firefox to log into Gemini, harvest cookies, and register account."""
     req = payload or WebBrowserLoginRequest()
-    login_url = "https://gemini.google.com"
+    timeout = req.poll_seconds if req.poll_seconds > 0 else 180.0
 
     try:
-        import webbrowser
-        webbrowser.open(login_url)
-    except Exception as exc:
-        logger.warning("Failed to open browser: %s", exc)
+        from core.auth_web import login_web_via_isolated_firefox
 
-    if req.poll_seconds > 0:
-        start_t = time.time()
-        while time.time() - start_t < req.poll_seconds:
-            await asyncio.sleep(1.0)
-            path, cookies = auto_discover_firefox_cookies()
-            if cookies and cookies.secure_1psid:
-                return await auto_detect_web_account(
-                    WebAutoDetectRequest(
-                        account_id=req.account_id,
-                        label=req.label,
-                        max_concurrency=req.max_concurrency,
-                        auto_link=True,
-                    )
-                )
+        cookies = await login_web_via_isolated_firefox(timeout_seconds=timeout)
+    except Exception as exc:
+        logger.error("Isolated Firefox web login failed: %s", exc)
+        return {
+            "success": False,
+            "logged_in": False,
+            "error": str(exc),
+            "message": f"Browser login failed: {exc}",
+        }
+
+    now = time.time()
+    raw_id = (req.account_id or "").strip() or f"web-{secrets.token_hex(4)}"
+    validated_id = _validate_account_id(raw_id)
+    cookie_file_path = get_account_cookie_cache_path(validated_id)
+    account_label = req.label.strip() or f"Firefox Web ({validated_id})"
+
+    account = WebAccount(
+        id=validated_id,
+        label=account_label,
+        max_concurrency=req.max_concurrency,
+        cookie_file=str(cookie_file_path),
+        cookies=cookies,
+        status="ACTIVE",
+        discovered_models=[],
+    )
+
+    save_account_cookies_isolated(account, sync_snapshot=False)
+    state_registry.upsert_web_account(account)
+    await _initialize_and_discover_web_account(account)
+    await save_accounts_snapshot()
 
     return {
         "success": True,
-        "logged_in": False,
-        "login_url": login_url,
-        "message": "Opened https://gemini.google.com in browser. Sign in and then click Auto-Detect.",
+        "logged_in": True,
+        "account_id": validated_id,
+        "message": f"Successfully authenticated and linked Web account '{validated_id}'!",
+        "account": _build_web_account_telemetry(account, now),
+        "hygiene_notice": get_saved_info_hygiene_notice(),
     }
 
 

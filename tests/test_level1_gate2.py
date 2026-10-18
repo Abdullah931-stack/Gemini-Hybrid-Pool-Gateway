@@ -65,8 +65,8 @@ from core import (
 
 
 def test_recursive_schema_cleaner_strips_all_20_unsupported_keys_and_preserves_named_properties() -> None:
-    """All 20 `cloudcode-pa` banned keys must be stripped deeply without deleting properties named `format` or `pattern`."""
-    expected_20_keys = {
+    """All cloudcode-pa banned keys must be stripped deeply without deleting properties named format or pattern."""
+    expected_unsupported_keys = {
         "additionalProperties",
         "$schema",
         "$id",
@@ -79,6 +79,8 @@ def test_recursive_schema_cleaner_strips_all_20_unsupported_keys_and_preserves_n
         "maxLength",
         "minimum",
         "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
         "multipleOf",
         "pattern",
         "format",
@@ -87,9 +89,22 @@ def test_recursive_schema_cleaner_strips_all_20_unsupported_keys_and_preserves_n
         "uniqueItems",
         "minProperties",
         "maxProperties",
+        "propertyNames",
+        "dependencies",
+        "dependentRequired",
+        "dependentSchemas",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "prefixItems",
+        "const",
+        "contentMediaType",
+        "contentEncoding",
+        "readOnly",
+        "writeOnly",
+        "deprecated",
     }
-    assert UNSUPPORTED_SCHEMA_KEYS == expected_20_keys
-    assert len(UNSUPPORTED_SCHEMA_KEYS) == 20
+    assert UNSUPPORTED_SCHEMA_KEYS == expected_unsupported_keys
+    assert len(UNSUPPORTED_SCHEMA_KEYS) == 35
 
     raw_schema: dict[str, Any] = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -149,7 +164,7 @@ def test_recursive_schema_cleaner_strips_all_20_unsupported_keys_and_preserves_n
     cleaned = clean_json_schema(raw_schema)
 
     # Top-level banned keys stripped
-    for key in expected_20_keys:
+    for key in expected_unsupported_keys:
         assert key not in cleaned
 
     # User-defined properties named "format", "pattern", "minimum" MUST survive
@@ -173,6 +188,54 @@ def test_recursive_schema_cleaner_strips_all_20_unsupported_keys_and_preserves_n
     assert "maxItems" not in tags_schema
     assert "uniqueItems" not in tags_schema
     assert tags_schema["items"] == {"type": "string"}
+
+
+def test_exclusive_minimum_and_maximum_deeply_stripped_from_nested_schema() -> None:
+    """exclusiveMinimum and exclusiveMaximum must be stripped from deep properties -> items -> properties."""
+    raw_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "commands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "const": "execute"},
+                        "line": {
+                            "type": "integer",
+                            "exclusiveMinimum": 0,
+                            "exclusiveMaximum": 1000,
+                        },
+                        "offset": {
+                            "type": "number",
+                            "exclusiveMinimum": 0.0,
+                        },
+                    },
+                    "required": ["line"],
+                },
+            },
+            "exclusiveMinimum": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+            },
+        },
+        "required": ["commands"],
+    }
+
+    cleaned = clean_json_schema(raw_schema)
+    # The property named "exclusiveMinimum" must survive
+    assert "exclusiveMinimum" in cleaned["properties"]
+    assert cleaned["properties"]["exclusiveMinimum"] == {"type": "integer"}
+
+    # Deep item properties must have exclusiveMinimum/Maximum stripped and const converted to enum
+    item_props = cleaned["properties"]["commands"]["items"]["properties"]
+    assert "exclusiveMinimum" not in item_props["line"]
+    assert "exclusiveMaximum" not in item_props["line"]
+    assert item_props["line"] == {"type": "integer"}
+    assert "exclusiveMinimum" not in item_props["offset"]
+    assert item_props["offset"] == {"type": "number"}
+    assert item_props["name"]["enum"] == ["execute"]
+    assert "const" not in item_props["name"]
 
 
 @pytest.mark.parametrize(

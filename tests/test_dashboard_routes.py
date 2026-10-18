@@ -18,7 +18,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -44,8 +44,11 @@ from config.settings import (
 @pytest.fixture(autouse=True)
 def clean_state_and_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Isolate registry and storage paths for each test execution."""
+    from api.dashboard_routes import _pending_oauth_events
+
     state_registry.reset()
     _pending_oauth_sessions.clear()
+    _pending_oauth_events.clear()
 
     test_accounts_file = tmp_path / "accounts.json"
     test_cookies_dir = tmp_path / "cookies_cache"
@@ -55,11 +58,18 @@ def clean_state_and_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("config.settings.COOKIES_CACHE_DIR", test_cookies_dir)
     monkeypatch.setattr("core.auth_web.COOKIES_CACHE_DIR", test_cookies_dir)
     monkeypatch.setattr("api.dashboard_routes.COOKIES_CACHE_DIR", test_cookies_dir)
+    monkeypatch.setattr("core.usage_monitor.sync_web_account_usage", AsyncMock())
+    monkeypatch.setattr("core.model_registry.discover_web_models", AsyncMock(return_value=["gemini-3.8-flash"]))
+
+    mock_default_session = MagicMock()
+    mock_default_session.proc.poll.return_value = 0
+    monkeypatch.setattr("api.dashboard_routes.IsolatedFirefoxSession", MagicMock(return_value=mock_default_session))
 
     yield
 
     state_registry.reset()
     _pending_oauth_sessions.clear()
+    _pending_oauth_events.clear()
 
 
 @pytest.fixture
@@ -417,7 +427,7 @@ def test_add_web_account_rejects_missing_cookies(client: TestClient):
 
 
 def test_delete_web_account_removes_from_registry_and_deletes_cache_file(client: TestClient):
-    """Verify DELETE /api/web-accounts/{id} unlinks cookie cache and removes account from registry."""
+    """Verify DELETE /api/web-accounts/{id} unlinks cookie cache and calls close_client."""
     add_res = client.post(
         "/api/web-accounts/add",
         json={
@@ -431,11 +441,13 @@ def test_delete_web_account_removes_from_registry_and_deletes_cache_file(client:
     cookie_path = Path(acc.cookie_file)
     assert cookie_path.exists()
 
-    # Delete
-    del_res = client.delete("/api/web-accounts/web-to-remove")
-    assert del_res.status_code == 200
-    assert state_registry.get_web_account("web-to-remove") is None
-    assert not cookie_path.exists()
+    with patch("core.auth_web.default_web_session_manager.close_client", new_callable=AsyncMock) as mock_close:
+        mock_close.return_value = True
+        del_res = client.delete("/api/web-accounts/web-to-remove")
+        assert del_res.status_code == 200
+        assert state_registry.get_web_account("web-to-remove") is None
+        assert not cookie_path.exists()
+        mock_close.assert_awaited_once_with("web-to-remove")
 
 
 def test_delete_web_account_nonexistent_returns_404(client: TestClient):
@@ -540,15 +552,110 @@ def test_web_account_auto_detect_not_logged_in(client: TestClient):
 
 
 def test_web_account_browser_login_endpoint(client: TestClient):
-    """Verify POST /api/web-accounts/browser-login opens browser and returns login URL."""
-    with patch("webbrowser.open") as mock_open:
+    """Verify POST /api/web-accounts/browser-login harvests cookies via isolated Firefox and registers account."""
+    mock_cookies = WebCookies(secure_1psid="mock_harvested_psid", secure_1psidts="mock_harvested_ts")
+    with patch("core.auth_web.login_web_via_isolated_firefox", new_callable=AsyncMock) as mock_harvest:
+        mock_harvest.return_value = mock_cookies
         response = client.post(
             "/api/web-accounts/browser-login",
-            json={"poll_seconds": 0},
+            json={"account_id": "web-harvested-acc", "poll_seconds": 180.0},
         )
         assert response.status_code == 200
         payload = response.json()
         assert payload["success"] is True
-        assert payload["login_url"] == "https://gemini.google.com"
-        mock_open.assert_called_once_with("https://gemini.google.com")
+        assert payload["logged_in"] is True
+        assert payload["account_id"] == "web-harvested-acc"
+        mock_harvest.assert_awaited_once_with(timeout_seconds=180.0)
+
+        acc = state_registry.get_web_account("web-harvested-acc")
+        assert acc is not None
+        assert acc.cookies.secure_1psid == "mock_harvested_psid"
+        assert len(acc.discovered_models) > 0
+
+
+def test_web_account_browser_login_failure(client: TestClient):
+    """Verify POST /api/web-accounts/browser-login handles exceptions gracefully."""
+    with patch("core.auth_web.login_web_via_isolated_firefox", side_effect=RuntimeError("Firefox closed")):
+        response = client.post(
+            "/api/web-accounts/browser-login",
+            json={"account_id": "web-failed-acc"},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is False
+        assert payload["logged_in"] is False
+        assert "Firefox closed" in payload["error"]
+
+
+def test_init_oauth_account_with_open_browser_creates_event(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """Verify POST /api/oauth-accounts/init with open_browser=True creates pending event and closes on callback."""
+    mock_launch = AsyncMock()
+    monkeypatch.setattr("api.dashboard_routes._launch_isolated_oauth_browser", mock_launch)
+
+    init_res = client.post(
+        "/api/oauth-accounts/init",
+        json={"open_browser": True, "label": "Isolated Browser OAuth"},
+    )
+    assert init_res.status_code == 200
+    state = init_res.json()["state"]
+    from api.dashboard_routes import _pending_oauth_events
+
+    assert state in _pending_oauth_events
+    event = _pending_oauth_events[state]
+    assert not event.is_set()
+    mock_launch.assert_called_once()
+
+    mock_credentials = OAuthCredentials(access_token="tok123", project_id="proj-auto-close")
+    with patch("api.dashboard_routes.complete_oauth_login", new_callable=AsyncMock, return_value=mock_credentials), \
+         patch("api.dashboard_routes.discover_oauth_models", new_callable=AsyncMock, return_value=["gemini-3.8-flash"]):
+        cb_res = client.get(f"/oauth/callback?code=mock_code&state={state}")
+        assert cb_res.status_code == 200
+        assert event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_launch_isolated_oauth_browser_lifecycle_and_cleanup():
+    """Verify _launch_isolated_oauth_browser waits for event and terminates/cleans up IsolatedFirefoxSession."""
+    import asyncio
+    from api.dashboard_routes import _launch_isolated_oauth_browser
+
+    event = asyncio.Event()
+    mock_session = MagicMock()
+    mock_session.proc.poll.return_value = None
+
+    with patch("api.dashboard_routes.IsolatedFirefoxSession", return_value=mock_session):
+        task = asyncio.create_task(_launch_isolated_oauth_browser("https://auth.url", event))
+        await asyncio.sleep(0.05)
+        assert not task.done()
+
+        # Set event to trigger automatic closing and cleanup
+        event.set()
+        await task
+        mock_session.close_and_cleanup.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_initialize_and_discover_web_account_without_type_error():
+    """Verify _initialize_and_discover_web_account calls get_or_init_client, sync_web_account_usage, and discover_web_models."""
+    from api.dashboard_routes import _initialize_and_discover_web_account
+    from config.settings import WebAccount, WebCookies
+
+    mock_account = WebAccount(
+        id="test-discover-acc",
+        cookies=WebCookies(secure_1psid="psid", secure_1psidts="ts"),
+    )
+    mock_client = MagicMock()
+
+    with patch("core.auth_web.default_web_session_manager.get_or_init_client", new_callable=AsyncMock, return_value=mock_client) as mock_get_client, \
+         patch("core.usage_monitor.sync_web_account_usage", new_callable=AsyncMock) as mock_sync_usage, \
+         patch("core.model_registry.discover_web_models", new_callable=AsyncMock, return_value=["gemini-4-argon", "gemini-3.8-flash"]) as mock_discover:
+
+        discovered = await _initialize_and_discover_web_account(mock_account)
+
+        assert discovered == ["gemini-4-argon", "gemini-3.8-flash"]
+        assert mock_account.discovered_models == ["gemini-4-argon", "gemini-3.8-flash"]
+        mock_get_client.assert_awaited_once_with(mock_account)
+        mock_sync_usage.assert_awaited_once_with(mock_account, client=mock_client, persist=False)
+        mock_discover.assert_awaited_once_with(mock_account, mock_client)
+
 

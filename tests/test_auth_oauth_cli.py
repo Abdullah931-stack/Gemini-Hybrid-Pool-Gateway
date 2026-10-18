@@ -16,6 +16,7 @@ import asyncio
 from pathlib import Path
 import sys
 import time
+import types
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -36,6 +37,7 @@ from core.auth_oauth_cli import (
     AgySubprocessTransport,
     OAuthCallbackServer,
     PKCEChallenge,
+    authorize_oauth_via_isolated_firefox,
     build_agy_subprocess_command,
     build_authorization_url,
     build_v1internal_headers,
@@ -280,7 +282,7 @@ def test_build_agy_subprocess_command() -> None:
 
 
 def test_get_oauth_client_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifies that client_id and client_secret resolve correctly and enforce env vars."""
+    """Verifies client_id and client_secret resolution (explicit, env var, builtin, disable flag)."""
     # 1. Explicit arguments take absolute precedence
     assert get_oauth_client_id("explicit_client_id") == "explicit_client_id"
     assert get_oauth_client_secret("explicit_secret") == "explicit_secret"
@@ -291,13 +293,93 @@ def test_get_oauth_client_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     assert get_oauth_client_id() == "env_test_id"
     assert get_oauth_client_secret() == "env_test_secret"
 
-    # 3. Missing both explicit argument and environment variables raises ValueError
+    # 3. Builtin fallback when env vars are unset and disable flag is not active
     monkeypatch.delenv("GEMINI_OAUTH_CLIENT_ID", raising=False)
     monkeypatch.delenv("GEMINI_OAUTH_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("GHPG_DISABLE_BUILTIN_OAUTH_CLIENT", raising=False)
+    assert "681255809395" in get_oauth_client_id()
+    assert get_oauth_client_secret() == "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"
 
-    with pytest.raises(ValueError, match="Google OAuth Client ID is missing"):
-        get_oauth_client_id()
+    # 4. GHPG_DISABLE_BUILTIN_OAUTH_CLIENT="1" or "true" raises ValueError if missing
+    for flag in ("1", "true", "True", " 1 "):
+        monkeypatch.setenv("GHPG_DISABLE_BUILTIN_OAUTH_CLIENT", flag)
+        with pytest.raises(ValueError, match="Google OAuth Client ID is missing"):
+            get_oauth_client_id()
+        with pytest.raises(ValueError, match="Google OAuth Client Secret is missing"):
+            get_oauth_client_secret()
 
-    with pytest.raises(ValueError, match="Google OAuth Client Secret is missing"):
-        get_oauth_client_secret()
+
+@pytest.mark.asyncio
+async def test_authorize_oauth_via_isolated_firefox_port_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies browser authorization falls back to port 0 on port conflict and returns code."""
+    pkce = generate_pkce_pair()
+
+    async def _fake_run_oauth(url: str, code_coro: any) -> str:
+        if hasattr(code_coro, "close"):
+            code_coro.close()
+        return "mock_captured_auth_code"
+
+    mock_run_oauth = AsyncMock(side_effect=_fake_run_oauth)
+    mock_launcher = types.ModuleType("core.firefox_launcher")
+    mock_launcher.run_oauth_in_isolated_firefox = mock_run_oauth
+    monkeypatch.setitem(sys.modules, "core.firefox_launcher", mock_launcher)
+
+    real_start = OAuthCallbackServer.start
+    call_ports: list[int] = []
+
+    async def _mock_start(server_self: OAuthCallbackServer) -> int:
+        call_ports.append(server_self.port)
+        if server_self.port == 8000:
+            raise OSError("Port 8000 is occupied")
+        return await real_start(server_self)
+
+    monkeypatch.setattr(OAuthCallbackServer, "start", _mock_start)
+
+    code, redirect_uri = await authorize_oauth_via_isolated_firefox(
+        pkce=pkce,
+        preferred_port=8000,
+        timeout=10.0,
+    )
+
+    assert code == "mock_captured_auth_code"
+    assert call_ports == [8000, 0]
+    assert redirect_uri.startswith("http://127.0.0.1:")
+    assert redirect_uri.endswith("/oauth/callback")
+    assert not redirect_uri.startswith("http://127.0.0.1:8000")
+
+    mock_run_oauth.assert_awaited_once()
+    auth_url_arg = mock_run_oauth.call_args[0][0]
+    assert auth_url_arg.startswith(GOOGLE_AUTH_URL)
+    assert f"code_challenge={pkce.code_challenge}" in auth_url_arg
+    assert f"state={pkce.state}" in auth_url_arg
+
+
+@pytest.mark.asyncio
+async def test_authorize_oauth_via_isolated_firefox_preferred_port_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies browser authorization uses preferred_port when binding succeeds."""
+    pkce = generate_pkce_pair()
+
+    async def _fake_run_oauth(url: str, code_coro: any) -> str:
+        if hasattr(code_coro, "close"):
+            code_coro.close()
+        return "code_preferred"
+
+    mock_run_oauth = AsyncMock(side_effect=_fake_run_oauth)
+    mock_launcher = types.ModuleType("core.firefox_launcher")
+    mock_launcher.run_oauth_in_isolated_firefox = mock_run_oauth
+    monkeypatch.setitem(sys.modules, "core.firefox_launcher", mock_launcher)
+
+    code, redirect_uri = await authorize_oauth_via_isolated_firefox(
+        pkce=pkce,
+        preferred_port=0,
+        timeout=10.0,
+    )
+
+    assert code == "code_preferred"
+    assert redirect_uri.startswith("http://127.0.0.1:")
+    mock_run_oauth.assert_awaited_once()
 

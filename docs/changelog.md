@@ -4,6 +4,51 @@ All notable changes to the **Gemini-Hybrid-Pool-Gateway** (`v3.2` architecture) 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-10-18
+
+### Added
+
+- **Isolated & Ephemeral Firefox Session Management ([`core/firefox_launcher.py`](core/firefox_launcher.py), [`tests/test_firefox_launcher.py`](tests/test_firefox_launcher.py)):**
+  - Implemented `IsolatedFirefoxSession` providing isolated Firefox execution using temporary profiles (`create_isolated_firefox_profile`) with custom `user.js` preferences disabling default browser prompts, crash recovery dialogs, and telemetry notifications.
+  - Added multi-platform binary resolution (`resolve_firefox_binary`) honoring `FIREFOX_BINARY_PATH`, `shutil.which`, and standard OS installation directories.
+  - Implemented automated cookie harvesting (`harvest_gemini_cookies_via_isolated_firefox`) with WAL/SHM sidecar synchronization (`_read_profile_cookies`) and SQLite connection fallback (`_query_moz_cookies_db`), capturing `__Secure-1PSID` and `__Secure-1PSIDTS` with stabilization validation.
+  - Added Windows detached process handling via `--wait-for-browser` flag and reliable process-tree termination using `taskkill /F /T /PID` alongside profile directory cleanup retries with lock backoff (`_cleanup_profile_directory`).
+  - Added OAuth monitoring flow (`run_oauth_in_isolated_firefox`) tracking browser window liveliness against authorization code task completion.
+- **Built-in Public Antigravity CLI OAuth Credentials ([`core/auth_oauth_cli.py`](core/auth_oauth_cli.py), [`.env.example`](.env.example)):**
+  - Added base64-encoded public Antigravity CLI OAuth client credentials (`_BUILTIN_CLI_CLIENT_ID_B64`, `_BUILTIN_CLI_CLIENT_SECRET_B64`), making manual OAuth client creation and `.env` setup optional.
+  - Added `GHPG_DISABLE_BUILTIN_OAUTH_CLIENT` environment variable toggle to disable built-in credentials when custom client isolation is required.
+  - Added `authorize_oauth_via_isolated_firefox` coordinating ephemeral port binding and isolated browser launch.
+- **Sidecar-Aware Cookie Extraction & Web Session Lifecycle Management ([`core/auth_web.py`](core/auth_web.py)):**
+  - Added `login_web_via_isolated_firefox` for zero-interaction Gemini web cookie acquisition.
+  - Hardened `extract_firefox_cookies` with uncheckpointed SQLite write-ahead log (`-wal`) and shared memory (`-shm`) sidecar cloning prior to database extraction.
+  - Added `WebSessionManager.close_client` and `WebSessionManager.close_all` providing safe client shutdown, cache flushing, and cookie persistence.
+
+### Fixed
+
+- **Protobuf Schema Sanitization & HTTP 400 Prevention ([`core/schema_sanitizer.py`](core/schema_sanitizer.py), [`tests/test_level1_gate2.py`](tests/test_level1_gate2.py)):**
+  - Resolved Google CloudCode PA `HTTP 400 INVALID_ARGUMENT` errors ("Cannot find field 'exclusiveMinimum'") by expanding `UNSUPPORTED_SCHEMA_KEYS` from 20 to 35 Protobuf/OpenAPI-incompatible meta-keys (including `exclusiveMinimum`, `exclusiveMaximum`, `const`, `propertyNames`, `dependencies`, `dependentRequired`, `dependentSchemas`, `unevaluatedProperties`, `unevaluatedItems`, `prefixItems`, `contentMediaType`, `contentEncoding`, `readOnly`, `writeOnly`, `deprecated`).
+  - Implemented `const` to single-item `enum` normalization in `clean_json_schema` for Protobuf schema compliance.
+  - Extended union flattening in `flatten_unions` to support `allOf` intersection schema blocks alongside `anyOf` and `oneOf`.
+- **Purge of Fake Models & Fabricated Quotas ([`core/model_registry.py`](core/model_registry.py), [`static/index.html`](static/index.html)):**
+  - Eliminated synthetic `remaining_fraction=1.0` quota fabrication in `_apply_fetch_models_quotas` and `_fallback_default_oauth_models`; model quotas remain empty until genuine quota buckets are returned by Google API.
+  - Prevented malformed JSON request payloads (`{"project": ""}`) in `fetch_available_models` and `retrieve_user_quota` when account project IDs are absent.
+  - Added Header Shield routing in `_build_oauth_headers` via `build_v1internal_headers`.
+- **ChatSession Compatibility & Reasoning Effort Parameter Handling ([`core/prefix_differ.py`](core/prefix_differ.py), [`tests/test_audit_verified_fixes.py`](tests/test_audit_verified_fixes.py)):**
+  - Fixed `TypeError: ChatSession.__init__() got an unexpected keyword argument 'temporary'` in `_start_client_chat_session` by directing `temporary` to `chat.send_message_stream`.
+  - Added automatic `extended_thinking=True` activation in `_open_chat_message_stream` for `reasoning_effort in ("high", "medium")`.
+- **Web Usage Synchronization Resilience ([`core/usage_monitor.py`](core/usage_monitor.py)):**
+  - Hardened `sync_web_account_usage` to accept optional `session_manager` parameter, supporting `inspect.isawaitable` in `_fetch_usage_from_gemini_client` with seamless fallback to direct `jSf9Qc` batchexecute RPC calls.
+- **Interactive UI & CLI Browser Decoupling ([`api/dashboard_routes.py`](api/dashboard_routes.py), [`main.py`](main.py), [`static/index.html`](static/index.html)):**
+  - Replaced legacy `webbrowser.open` calls across `main.py`, `api/dashboard_routes.py`, and `static/index.html` with isolated Firefox workflows.
+  - Updated `POST /api/web-accounts/browser-login` to asynchronously harvest credentials and link accounts via isolated Firefox.
+
+### Changed
+
+- **Version Control & Credentials Hygiene ([`.gitignore`](.gitignore)):**
+  - Added `config/accounts.json`, `config/accounts.json.*`, and `config/model_routes.json` to `.gitignore` to prevent inadvertent tracking of runtime credentials and dynamic routes.
+- **Architectural Documentation ([`docs/RELEASE_NOTES_v0.2.2.md`](docs/RELEASE_NOTES_v0.2.2.md)):**
+  - Published comprehensive technical release notes detailing isolated browser architecture, schema sanitization mechanics, and anti-mocking verification.
+
 ## [0.2.1] - 2026-10-17
 
 ### Added

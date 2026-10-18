@@ -815,7 +815,7 @@
         <div class="routing-add-field">
           <label class="form-label">Primary Channel</label>
           <select class="form-select" id="newRoutePrimary">
-            <option value="oauth">OAuth CLI (CloudCode)</option>
+            <option value="oauth">Antigravity CLI (CloudCode)</option>
             <option value="web">Web Cookie (Google AI Pro)</option>
           </select>
         </div>
@@ -823,7 +823,7 @@
           <label class="form-label">Failover Channel</label>
           <select class="form-select" id="newRouteFailover">
             <option value="web">Web Cookie (Google AI Pro)</option>
-            <option value="oauth">OAuth CLI (CloudCode)</option>
+            <option value="oauth">Antigravity CLI (CloudCode)</option>
             <option value="none">None (Exclusive Primary Only)</option>
           </select>
         </div>
@@ -847,17 +847,17 @@
           </thead>
           <tbody id="modelRoutesTableBody">
             <tr>
-              <td colspan="6" style="text-align: center; color: var(--text-dim); padding: 2rem;">No active models or routes in the pool. Link an OAuth CLI or Web Cookie account to discover models.</td>
+              <td colspan="6" style="text-align: center; color: var(--text-dim); padding: 2rem;">No active models or routes in the pool. Link an Antigravity CLI or Web Cookie account to discover models.</td>
             </tr>
           </tbody>
         </table>
       </div>
     </div>
 
-    <!-- Section 1: OAuth CLI Accounts -->
+    <!-- Section 1: Antigravity CLI Accounts -->
     <div class="section-header">
       <div class="section-title">
-        <span>🔑 OAuth CLI Accounts (CloudCode Channel)</span>
+        <span>🔑 Antigravity CLI Accounts (CloudCode Channel)</span>
         <span class="count" id="countOAuth">0</span>
       </div>
     </div>
@@ -892,7 +892,7 @@
   <div class="modal-overlay" id="modalOAuth">
     <div class="modal-card">
       <div class="modal-header">
-        <div class="modal-title">Connect Google Account (OAuth CLI)</div>
+        <div class="modal-title">Connect Google Account (Antigravity CLI)</div>
         <button class="modal-close" onclick="closeOAuthModal()">&times;</button>
       </div>
 
@@ -951,15 +951,15 @@
   <div class="modal-overlay" id="modalWeb">
     <div class="modal-card">
       <div class="modal-header">
-        <div class="modal-title">Link Gemini Web Session</div>
+        <div class="modal-title">Link Gemini Web Session (Isolated Firefox)</div>
         <button class="modal-close" onclick="closeWebModal()">&times;</button>
       </div>
 
       <div style="text-align: center; padding: 0.5rem 0 1rem 0;">
         <div style="font-size: 2.5rem; margin-bottom: 0.25rem;">🌐</div>
-        <h3 style="font-size: 1.05rem; margin-bottom: 0.35rem;">1-Click Browser Cookie Import</h3>
+        <h3 style="font-size: 1.05rem; margin-bottom: 0.35rem;">Isolated Browser Cookie Capture</h3>
         <p style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 1.25rem; line-height: 1.4;">
-          Automatically capture your logged-in Google Gemini session from Firefox with zero manual copy-pasting.
+          Launch an isolated Firefox instance to sign into Gemini. Cookies are harvested automatically and the profile is completely wiped.
         </p>
 
         <div class="form-group" style="text-align: left; margin-bottom: 1rem;">
@@ -967,27 +967,12 @@
           <input type="text" class="form-input" id="webAccountLabel" placeholder="e.g. Gemini Pro Web" />
         </div>
 
-        <button class="btn btn-success" id="btnAutoDetectWeb" style="width: 100%; padding: 0.75rem 1.25rem; font-size: 0.95rem; justify-content: center; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.4);" onclick="autoDetectWebAccount()">
-          <span>🌐 1-Click Auto-Detect from Browser / Firefox</span>
+        <button class="btn btn-success" id="btnBrowserLoginWeb" style="width: 100%; padding: 0.75rem 1.25rem; font-size: 0.95rem; justify-content: center; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.4);" onclick="openGeminiInBrowser()">
+          <span>🌐 Sign In via Isolated Firefox (1-Click)</span>
         </button>
 
-        <!-- Dynamic Status / Sign-In Guidance Area -->
-        <div id="webAutoDetectNotice" style="display: none; margin-top: 1rem; padding: 0.9rem; background: var(--bg-card-subtle); border-radius: var(--radius-sm); border: 1px solid var(--border-color); text-align: left;">
-          <div style="display: flex; align-items: center; gap: 0.5rem; color: var(--accent-amber); font-size: 0.85rem; font-weight: 600;">
-            <span>⚠️</span>
-            <span id="webNoticeHeading">Not Signed In</span>
-          </div>
-          <p id="webNoticeBody" style="font-size: 0.8rem; color: var(--text-muted); margin: 0.4rem 0 0.8rem 0; line-height: 1.4;">
-            No active session detected. Click below to open Gemini in your browser, sign in with your Google account, and click auto-detect!
-          </p>
-          <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
-            <button class="btn btn-primary btn-sm" onclick="openGeminiInBrowser()">
-              <span>🚀 Open Gemini in Browser to Sign In</span>
-            </button>
-            <button class="btn btn-outline btn-sm" onclick="autoDetectWebAccount()">
-              <span>🔄 I've Signed In - Capture Cookies Now</span>
-            </button>
-          </div>
+        <div id="webWaitingText" style="display: none; margin-top: 1rem; padding: 0.9rem; background: var(--bg-card-subtle); border-radius: var(--radius-sm); border: 1px solid var(--accent-cyan); color: var(--accent-cyan); font-size: 0.85rem; font-weight: 500; text-align: center; line-height: 1.5;">
+          نافذة Firefox المعزولة مفتوحة الآن.. سجّل الدخول في Google وسيُغلق المتصفح ويرتبط الحساب تلقائياً
         </div>
       </div>
 
@@ -1101,12 +1086,12 @@
 
     function openWebModal() {
       document.getElementById("modalWeb").classList.add("active");
-      const notice = document.getElementById("webAutoDetectNotice");
-      if (notice) notice.style.display = "none";
-      const btn = document.getElementById("btnAutoDetectWeb");
+      const waitingText = document.getElementById("webWaitingText");
+      if (waitingText) waitingText.style.display = "none";
+      const btn = document.getElementById("btnBrowserLoginWeb");
       if (btn) {
         btn.disabled = false;
-        btn.innerHTML = "<span>🌐 1-Click Auto-Detect from Browser / Firefox</span>";
+        btn.innerHTML = "<span>🌐 Sign In via Isolated Firefox (1-Click)</span>";
       }
     }
 
@@ -1157,7 +1142,7 @@
 
       if (btn) {
         btn.disabled = true;
-        btn.innerHTML = "<span>⏳ Connecting to Google...</span>";
+        btn.innerHTML = "<span>⏳ Connecting to Google via Isolated Firefox...</span>";
       }
 
       try {
@@ -1165,7 +1150,7 @@
         const resp = await fetch("/api/oauth-accounts/init", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ redirect_uri: redirectUri, label: label }),
+          body: JSON.stringify({ redirect_uri: redirectUri, label: label, open_browser: true }),
         });
         if (!resp.ok) throw new Error(await resp.text());
         const data = await resp.json();
@@ -1173,15 +1158,6 @@
 
         if (spinner) spinner.style.display = "block";
         if (manualLink) manualLink.href = data.auth_url;
-
-        const width = 600, height = 700;
-        const left = window.screen.width / 2 - width / 2;
-        const top = window.screen.height / 2 - height / 2;
-        window.open(
-          data.auth_url,
-          'GoogleAuth',
-          `toolbar=no,location=no,status=no,menubar=no,scrollbars=yes,resizable=yes,width=${width},height=${height},top=${top},left=${left}`
-        );
 
         const initialCount = (window.lastTelemetry && window.lastTelemetry.oauth_accounts)
           ? window.lastTelemetry.oauth_accounts.length
@@ -1196,7 +1172,7 @@
               if (statusData.oauth_accounts && statusData.oauth_accounts.length > initialCount) {
                 clearInterval(oauthCheckInterval);
                 oauthCheckInterval = null;
-                showToast("Google account authorized and linked!");
+                showToast("Google account authorized and linked via isolated Firefox!");
                 closeOAuthModal();
                 renderDashboard(statusData);
                 await fetchModelRoutes();
@@ -1211,7 +1187,7 @@
         showToast(`OAuth init failed: ${err.message}`, "error");
         if (btn) {
           btn.disabled = false;
-          btn.innerHTML = "<span>🚀 Sign in with Google (One-Click)</span>";
+          btn.innerHTML = "<span>🚀 Sign in with Google (Isolated Firefox)</span>";
         }
       }
     }
@@ -1232,21 +1208,13 @@
         const btn = document.getElementById("btnStartGoogleOAuth");
         if (btn) {
           btn.disabled = false;
-          btn.innerHTML = "<span>🚀 Sign in with Google (One-Click)</span>";
+          btn.innerHTML = "<span>🚀 Sign in with Google (Isolated Firefox)</span>";
         }
       }
     });
 
     async function autoDetectWebAccount() {
-      const btn = document.getElementById("btnAutoDetectWeb");
-      const notice = document.getElementById("webAutoDetectNotice");
       const label = (document.getElementById("webAccountLabel")?.value || "").trim();
-
-      if (btn) {
-        btn.disabled = true;
-        btn.innerHTML = "<span>⏳ Scanning for Firefox Gemini Session...</span>";
-      }
-
       try {
         const resp = await fetch("/api/web-accounts/auto-detect", {
           method: "POST",
@@ -1254,41 +1222,58 @@
           body: JSON.stringify({ label: label, auto_link: true }),
         });
         const data = await resp.json();
-
         if (data.logged_in && data.success) {
           showToast(data.message || "Web account automatically detected and linked!");
           closeWebModal();
           await fetchGatewayStatus();
           await fetchModelRoutes();
         } else {
-          if (notice) {
-            notice.style.display = "block";
-            const headingEl = document.getElementById("webNoticeHeading");
-            if (headingEl) headingEl.innerText = "No Active Session Found";
-            const bodyEl = document.getElementById("webNoticeBody");
-            if (bodyEl) {
-              bodyEl.innerText = "Could not find an active Gemini login in Firefox. Click 'Open Gemini in Browser to Sign In', log into Google, then click 'Capture Cookies Now'.";
-            }
-          }
-          showToast("No active Firefox Gemini session found. Please sign in first.", "error");
+          showToast("No active Firefox Gemini session found.", "error");
         }
       } catch (err) {
         showToast(`Auto-detect failed: ${err.message}`, "error");
-      } finally {
-        if (btn) {
-          btn.disabled = false;
-          btn.innerHTML = "<span>🌐 1-Click Auto-Detect from Browser / Firefox</span>";
-        }
       }
     }
 
-    function openGeminiInBrowser() {
-      window.open("https://gemini.google.com", "_blank");
-      fetch("/api/web-accounts/browser-login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ poll_seconds: 0 }),
-      }).catch(() => {});
+    async function openGeminiInBrowser() {
+      const btn = document.getElementById("btnBrowserLoginWeb");
+      const waitingText = document.getElementById("webWaitingText");
+      const label = (document.getElementById("webAccountLabel")?.value || "").trim();
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = "<span>⏳ نافذة Firefox المعزولة مفتوحة...</span>";
+      }
+      if (waitingText) {
+        waitingText.style.display = "block";
+        waitingText.innerText = "نافذة Firefox المعزولة مفتوحة الآن.. سجّل الدخول في Google وسيُغلق المتصفح ويرتبط الحساب تلقائياً";
+      }
+
+      try {
+        const resp = await fetch("/api/web-accounts/browser-login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label: label, poll_seconds: 180 }),
+        });
+        const data = await resp.json();
+
+        if (data.logged_in && data.success) {
+          showToast(data.message || "تم تسجيل الدخول بنجاح وربط حساب الويب!");
+          closeWebModal();
+          await fetchGatewayStatus();
+          await fetchModelRoutes();
+        } else {
+          showToast(data.message || data.error || "فشل تسجيل الدخول أو تم إغلاق المتصفح", "error");
+        }
+      } catch (err) {
+        showToast(`Browser login error: ${err.message}`, "error");
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = "<span>🌐 Sign In via Isolated Firefox (1-Click)</span>";
+        }
+        if (waitingText) waitingText.style.display = "none";
+      }
     }
 
     async function completeOAuthSubmission() {
@@ -1611,7 +1596,7 @@
       if (!tbody) return;
       const routes = data.routes || [];
       if (routes.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-dim); padding: 2rem;">No active models or routes in the pool. Link an OAuth CLI or Web Cookie account to discover models.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-dim); padding: 2rem;">No active models or routes in the pool. Link an Antigravity CLI or Web Cookie account to discover models.</td></tr>`;
         return;
       }
 
@@ -1648,14 +1633,14 @@
             <td>${typeBadge}</td>
             <td>
               <select class="channel-select" id="selectPrimary_${idx}">
-                <option value="oauth" ${primaryOAuthSelected}>OAuth CLI</option>
+                <option value="oauth" ${primaryOAuthSelected}>Antigravity CLI</option>
                 <option value="web" ${primaryWebSelected}>Web Cookie</option>
               </select>
             </td>
             <td>
               <select class="channel-select" id="selectFailover_${idx}">
                 <option value="none" ${failoverNoneSelected}>None (Exclusive)</option>
-                <option value="oauth" ${failoverOAuthSelected}>OAuth CLI</option>
+                <option value="oauth" ${failoverOAuthSelected}>Antigravity CLI</option>
                 <option value="web" ${failoverWebSelected}>Web Cookie</option>
               </select>
             </td>

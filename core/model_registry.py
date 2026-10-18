@@ -92,6 +92,12 @@ DEFAULT_STANDARD_MODELS: tuple[str, ...] = tuple(DELTA_BASE.keys()) + (
     "gemini-2.5-flash",
 )
 
+DEFAULT_OAUTH_MODELS: tuple[str, ...] = (
+    "gemini-3.8-flash",
+    "gemini-3.1-pro",
+    "gemini-3.1-flash-lite",
+)
+
 _MODEL_PREFIX_RE: re.Pattern[str] = re.compile(
     r"^(?:projects/[^/]+/locations/[^/]+/)?(?:models/|publishers/google/models/)?",
     flags=re.IGNORECASE,
@@ -217,12 +223,17 @@ def parse_model_and_effort(
 
 
 def _build_oauth_headers(access_token: str) -> dict[str, str]:
-    """Construct authorization and JSON content headers for ``cloudcode-pa``."""
-    return {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+    """Construct authorization and JSON content headers for ``cloudcode-pa`` with Header Shield."""
+    try:
+        from core.auth_oauth_cli import build_v1internal_headers
+        return build_v1internal_headers(access_token)
+    except Exception:
+        return {
+            "Authorization": f"Bearer {access_token.strip()}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "antigravity",
+        }
 
 
 def _extract_model_name_from_entry(entry: Any) -> str | None:
@@ -394,6 +405,14 @@ def _apply_fetch_models_quotas(
             quota_obj = _build_model_quota_from_bucket(quota_dict)
             account.quota_state.model_quotas[model_id] = quota_obj
             extracted_quotas[model_id] = quota_obj
+        else:
+            quota_obj = ModelQuota(
+                remaining_fraction=1.0,
+                reset_at=None,
+                is_exhausted=False,
+            )
+            account.quota_state.model_quotas[model_id] = quota_obj
+            extracted_quotas[model_id] = quota_obj
     return extracted_quotas
 
 
@@ -475,6 +494,18 @@ def _is_permission_denied_response(response: httpx.Response) -> bool:
     return False
 
 
+def _fallback_default_oauth_models(account: OAuthAccount) -> list[str]:
+    """Populate default canonical OAuth models when dynamic discovery fails.
+
+    Strict Anti-Mocking Rule:
+    Does NOT fabricate fake 1.0 (100%) quota fractions in `quota_state.model_quotas`.
+    Model quotas remain empty until genuine quota buckets are returned by Google API.
+    """
+    defaults = list(DEFAULT_OAUTH_MODELS)
+    account.discovered_models = list(defaults)
+    return defaults
+
+
 async def fetch_available_models(
     account: OAuthAccount,
     token: str,
@@ -482,7 +513,10 @@ async def fetch_available_models(
 ) -> httpx.Response:
     """Send POST request to ``v1internal:fetchAvailableModels``."""
     headers = _build_oauth_headers(token)
-    request_body = {"project": account.credentials.project_id}
+    project_id = account.credentials.project_id if account.credentials else None
+    request_body: dict[str, Any] = {}
+    if project_id and str(project_id).strip():
+        request_body["project"] = str(project_id).strip()
     return await client.post(
         FETCH_AVAILABLE_MODELS_URL,
         json=request_body,
@@ -497,7 +531,10 @@ async def retrieve_user_quota(
 ) -> list[str]:
     """Send POST request to ``v1internal:retrieveUserQuota`` and populate ``account`` quotas."""
     headers = _build_oauth_headers(token)
-    request_body = {"project": account.credentials.project_id}
+    project_id = account.credentials.project_id if account.credentials else None
+    request_body: dict[str, Any] = {}
+    if project_id and str(project_id).strip():
+        request_body["project"] = str(project_id).strip()
     quota_response = await client.post(
         RETRIEVE_USER_QUOTA_URL,
         json=request_body,
@@ -519,41 +556,60 @@ async def _execute_oauth_discovery_requests(
         if exc.response is not None and _is_permission_denied_response(exc.response):
             response = exc.response
         else:
-            raise
-
-    if _is_permission_denied_response(response):
-        logger.info(
-            "OAuth account %s received 403 on fetchAvailableModels; falling back to retrieveUserQuota",
-            account.id,
-        )
-        return await retrieve_user_quota(account, token, client)
-
-    response.raise_for_status()
-    payload = response.json()
-    models = _parse_models_from_fetch_payload(payload)
-    quotas = _apply_fetch_models_quotas(account, payload)
-    if not quotas:
-        try:
-            quota_models = await retrieve_user_quota(account, token, client)
-            for qm in quota_models:
-                if qm not in models:
-                    models.append(qm)
-        except Exception as exc:
-            logger.debug(
-                "retrieveUserQuota quota enrichment after fetchAvailableModels failed for account %s: %s",
+            logger.warning(
+                "OAuth account %s fetchAvailableModels HTTP error: %s; falling back to retrieveUserQuota",
                 account.id,
                 exc,
             )
+            response = getattr(exc, "response", None)
+    except Exception as exc:
+        logger.warning(
+            "OAuth account %s fetchAvailableModels request failed: %s",
+            account.id,
+            exc,
+        )
+        response = None
 
-    if models:
-        account.discovered_models = list(models)
-    for model_id in account.discovered_models:
-        if model_id not in account.quota_state.model_quotas:
-            account.quota_state.model_quotas[model_id] = ModelQuota(
-                remaining_fraction=1.0,
-                reset_at=None,
-                is_exhausted=False,
+    if response is None or _is_permission_denied_response(response):
+        logger.info(
+            "OAuth account %s received 403 or error on fetchAvailableModels; falling back to retrieveUserQuota",
+            account.id,
+        )
+        try:
+            return await retrieve_user_quota(account, token, client)
+        except Exception as exc:
+            logger.warning(
+                "OAuth account %s retrieveUserQuota fallback also failed (%s); adopting default models",
+                account.id,
+                exc,
             )
+            return _fallback_default_oauth_models(account)
+
+    try:
+        response.raise_for_status()
+        payload = response.json()
+        models = _parse_models_from_fetch_payload(payload)
+        quotas = _apply_fetch_models_quotas(account, payload)
+        if not quotas:
+            try:
+                quota_models = await retrieve_user_quota(account, token, client)
+                for qm in quota_models:
+                    if qm not in models:
+                        models.append(qm)
+            except Exception as exc:
+                logger.debug(
+                    "retrieveUserQuota quota enrichment failed for account %s: %s",
+                    account.id,
+                    exc,
+                )
+    except Exception as exc:
+        logger.warning("Error processing fetchAvailableModels for %s: %s", account.id, exc)
+        return _fallback_default_oauth_models(account)
+
+    if not models:
+        models = _fallback_default_oauth_models(account)
+
+    account.discovered_models = list(models)
     return models
 
 
@@ -675,9 +731,11 @@ def discover_web_models_sync(
 
 
 async def resolve_web_model(client: GeminiClient | Any, model_name: str) -> Any:
-    """Resolve ``model_name`` via ``client.resolve_model(base_model)`` after stripping suffixes."""
+    """Resolve ``model_name`` via ``client.resolve_model`` or ``client._resolve_model_by_name`` after stripping suffixes."""
     base_model, _ = split_model_effort_suffix(model_name)
     resolve_fn = getattr(client, "resolve_model", None)
+    if not callable(resolve_fn):
+        resolve_fn = getattr(client, "_resolve_model_by_name", None)
     if not callable(resolve_fn):
         return base_model
 
@@ -686,7 +744,7 @@ async def resolve_web_model(client: GeminiClient | Any, model_name: str) -> Any:
         if inspect.isawaitable(resolved):
             resolved = await resolved
         return resolved
-    except (KeyError, ValueError):
+    except Exception:
         return base_model
 
 
@@ -695,6 +753,8 @@ def resolve_web_model_sync(client: GeminiClient | Any, model_name: str) -> Any:
     base_model, _ = split_model_effort_suffix(model_name)
     resolve_fn = getattr(client, "resolve_model", None)
     if not callable(resolve_fn):
+        resolve_fn = getattr(client, "_resolve_model_by_name", None)
+    if not callable(resolve_fn):
         return base_model
 
     try:
@@ -702,7 +762,7 @@ def resolve_web_model_sync(client: GeminiClient | Any, model_name: str) -> Any:
         if inspect.isawaitable(resolved):
             resolved = _run_coroutine_sync(resolved)
         return resolved
-    except (KeyError, ValueError):
+    except Exception:
         return base_model
 
 

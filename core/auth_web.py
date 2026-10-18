@@ -225,22 +225,36 @@ def _query_moz_cookies_file(db_path: Path, domain_suffix: str) -> dict[str, str]
     return found_cookies
 
 
+def _copy_sqlite_and_sidecars(src_sqlite: Path, dest_dir: Path) -> Path:
+    """Copy sqlite database and any existing WAL/SHM sidecars to dest_dir."""
+    dest_db = dest_dir / src_sqlite.name
+    shutil.copy2(src_sqlite, dest_db)
+    for suffix in ("-wal", "-shm"):
+        sidecar = src_sqlite.with_name(f"{src_sqlite.name}{suffix}")
+        if sidecar.exists():
+            try:
+                shutil.copy2(sidecar, dest_dir / f"{src_sqlite.name}{suffix}")
+            except OSError as exc:
+                logger.debug("Could not copy sidecar %s: %s", sidecar, exc)
+    return dest_db
+
+
 def _read_moz_cookies_with_temp_fallback(
     sqlite_path: Path,
     domain_name: str,
 ) -> dict[str, str]:
-    """Read ``moz_cookies`` directly, copying to a temp dir if locked by Firefox."""
+    """Read ``moz_cookies`` directly, copying to a temp dir if locked by Firefox or WAL present."""
+    wal_path = sqlite_path.with_name(f"{sqlite_path.name}-wal")
+    if wal_path.exists():
+        with tempfile.TemporaryDirectory(prefix="ghpg_ff_cookies_") as tmp_dir_str:
+            tmp_db = _copy_sqlite_and_sidecars(sqlite_path, Path(tmp_dir_str))
+            return _query_moz_cookies_file(tmp_db, domain_name)
+
     try:
         return _query_moz_cookies_file(sqlite_path, domain_name)
     except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
         with tempfile.TemporaryDirectory(prefix="ghpg_ff_cookies_") as tmp_dir_str:
-            tmp_dir = Path(tmp_dir_str)
-            tmp_db = tmp_dir / "cookies.sqlite"
-            shutil.copy2(sqlite_path, tmp_db)
-            for suffix in ("-wal", "-shm"):
-                sidecar = sqlite_path.with_name(f"{sqlite_path.name}{suffix}")
-                if sidecar.exists():
-                    shutil.copy2(sidecar, tmp_dir / f"cookies.sqlite{suffix}")
+            tmp_db = _copy_sqlite_and_sidecars(sqlite_path, Path(tmp_dir_str))
             return _query_moz_cookies_file(tmp_db, domain_name)
 
 
@@ -262,19 +276,12 @@ def _merge_sqlite_cookies_fallback(
             ) from exc
 
 
-def extract_firefox_cookies(
-    cookie_file: str | Path,
-    domain_name: str = DEFAULT_GOOGLE_COOKIE_DOMAIN,
+def _extract_firefox_cookies_from_path(
+    sqlite_path: Path,
+    domain_name: str,
 ) -> WebCookies:
-    """Extract ``__Secure-1PSID`` and ``__Secure-1PSIDTS`` from a Firefox SQLite file.
-
-    Uses ``browser_cookie3.firefox`` first and seamlessly falls back to reading
-    ``moz_cookies`` via ``sqlite3`` if ``browser_cookie3`` fails or misses either
-    cookie. Raises ``ValueError`` if ``__Secure-1PSID`` is absent or empty.
-    """
-    sqlite_path = _resolve_firefox_sqlite_path(cookie_file)
+    """Extract cookies from an accessible SQLite path via browser_cookie3 and fallback."""
     cookies_map = _extract_via_browser_cookie3(sqlite_path, domain_name)
-
     if (
         not cookies_map.get(SECURE_1PSID_COOKIE_NAME)
         or not cookies_map.get(SECURE_1PSIDTS_COOKIE_NAME)
@@ -291,6 +298,29 @@ def extract_firefox_cookies(
         secure_1psid=secure_1psid,
         secure_1psidts=cookies_map.get(SECURE_1PSIDTS_COOKIE_NAME, "").strip(),
     )
+
+
+def extract_firefox_cookies(
+    cookie_file: str | Path,
+    domain_name: str = DEFAULT_GOOGLE_COOKIE_DOMAIN,
+) -> WebCookies:
+    """Extract ``__Secure-1PSID`` and ``__Secure-1PSIDTS`` from a Firefox SQLite file.
+
+    Uses ``browser_cookie3.firefox`` first and seamlessly falls back to reading
+    ``moz_cookies`` via ``sqlite3`` if ``browser_cookie3`` fails or misses either
+    cookie. If a WAL file exists, copies the database and sidecars to a temporary
+    directory to avoid locked errors and read uncheckpointed commits.
+    Raises ``ValueError`` if ``__Secure-1PSID`` is absent or empty.
+    """
+    sqlite_path = _resolve_firefox_sqlite_path(cookie_file)
+    wal_path = sqlite_path.with_name(f"{sqlite_path.name}-wal")
+    if wal_path.exists():
+        with tempfile.TemporaryDirectory(prefix="ghpg_ff_wal_") as tmp_dir_str:
+            tmp_db = _copy_sqlite_and_sidecars(sqlite_path, Path(tmp_dir_str))
+            return _extract_firefox_cookies_from_path(tmp_db, domain_name)
+
+    return _extract_firefox_cookies_from_path(sqlite_path, domain_name)
+
 
 
 def auto_discover_firefox_cookies(
@@ -394,6 +424,21 @@ def auto_discover_firefox_cookies(
 
     return (None, None)
 
+
+async def login_web_via_isolated_firefox(
+    timeout_seconds: float = 180.0,
+    domain_name: str = DEFAULT_GOOGLE_COOKIE_DOMAIN,
+) -> WebCookies:
+    """Launch an isolated Firefox instance to harvest Gemini session cookies."""
+    from core.firefox_launcher import harvest_gemini_cookies_via_isolated_firefox
+
+    res = harvest_gemini_cookies_via_isolated_firefox(
+        timeout_seconds=timeout_seconds,
+        domain_name=domain_name,
+    )
+    if inspect.isawaitable(res):
+        res = await res
+    return res
 
 
 def _clean_cookie_token(raw_token: str, prefix_key: str) -> str:
@@ -895,28 +940,68 @@ class WebSessionManager:
                 auto_refresh=auto_refresh,
             )
 
+    async def _flush_client_cookies_on_close(
+        self, account_id: str, account: WebAccount | None, client: Any
+    ) -> None:
+        """Helper to save cookies for account upon client closure."""
+        target = account or (
+            state_registry.get_web_account(account_id)
+            if hasattr(state_registry, "get_web_account")
+            else None
+        )
+        if target is None and hasattr(state_registry, "web_accounts"):
+            target = next((a for a in state_registry.web_accounts if a.id == account_id), None)
+        if target is not None:
+            try:
+                await save_account_cookies_isolated(
+                    target,
+                    client=client,
+                    cache_dir=self._cache_dir,
+                    sync_snapshot=self._sync_snapshot,
+                )
+            except Exception as exc:
+                logger.warning("Error saving cookies while closing client for '%s': %s", account_id, exc)
+
+    async def close_client(self, account_id_or_account: str | WebAccount) -> bool:
+        """Close an active GeminiClient for an account and persist latest cookies.
+
+        Accepts either str account_id or WebAccount.
+        Returns True if client existed and was closed, False otherwise.
+        """
+        is_acc = isinstance(account_id_or_account, WebAccount)
+        account_id = account_id_or_account.id if is_acc else str(account_id_or_account)
+        client = self._clients.pop(account_id, None)
+        if client is None:
+            return False
+
+        account = account_id_or_account if is_acc else None
+        await self._flush_client_cookies_on_close(account_id, account, client)
+
+        try:
+            if hasattr(client, "close") and callable(client.close):
+                res = client.close()
+                if inspect.isawaitable(res):
+                    await res
+        except Exception as exc:
+            logger.warning("Error closing GeminiClient for account '%s': %s", account_id, exc)
+
+        return True
+
+    async def close_all(self) -> None:
+        """Safely iterate through all active clients and close them."""
+        for acc_id in list(self._clients.keys()):
+            try:
+                await self.close_client(acc_id)
+            except Exception as exc:
+                logger.warning(
+                    "Error closing client for account '%s' in close_all: %s",
+                    acc_id,
+                    exc,
+                )
+
     async def _persist_and_close_existing(self, account: WebAccount) -> None:
         """Save latest cookies and close the existing ``GeminiClient`` for ``account`` if present."""
-        existing_client = self._clients.pop(account.id, None)
-        if existing_client is None:
-            return
-        await save_account_cookies_isolated(
-            account,
-            client=existing_client,
-            cache_dir=self._cache_dir,
-            sync_snapshot=self._sync_snapshot,
-        )
-        try:
-            if getattr(existing_client, "_running", False) or getattr(
-                existing_client, "client", None
-            ) is not None:
-                await existing_client.close()
-        except Exception as exc:
-            logger.warning(
-                "Error closing existing GeminiClient for account '%s': %s",
-                account.id,
-                exc,
-            )
+        await self.close_client(account)
 
     # Clean Code Rule 3 exception: `close_only` boolean keyword argument is mandated
     # by the Level 2 specification contract for `safe_reinit_or_close`. Callers may

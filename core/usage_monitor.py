@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import inspect
 import json
 import logging
 import re
@@ -671,82 +672,103 @@ def apply_web_usage_update(
     )
 
 
+async def _fetch_usage_from_gemini_client(
+    client: Any, account_id: str
+) -> WebUsageData | None:
+    """Fetch and parse usage data from an active GeminiClient instance."""
+    try:
+        if hasattr(client, "_fetch_usage_info") and callable(client._fetch_usage_info):
+            res = client._fetch_usage_info()
+            if inspect.isawaitable(res):
+                await res
+            raw_info = getattr(client, "_usage_info", None)
+            if raw_info and isinstance(raw_info, dict):
+                return _parse_usage_info_dict(raw_info)
+    except Exception as exc:
+        logger.warning(
+            "GeminiClient._fetch_usage_info failed for account '%s': %s",
+            account_id,
+            exc,
+        )
+    return None
+
+
+async def _fetch_usage_via_direct_batchexecute(
+    account: WebAccount,
+    http_client: httpx.AsyncClient | None = None,
+    persist: bool = True,
+) -> tuple[WebUsageData | None, bool]:
+    """Execute direct batchexecute RPC jSf9Qc on /usage. Returns (usage_data, is_suspended)."""
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+        ),
+        "X-Same-Domain": "1",
+    }
+    cookies = account.cookies.to_dict()
+    post_data = {"f.req": json.dumps([[[JSF9QC_RPC_ID, "[]", None, "generic"]]])}
+    params = {"rpcids": JSF9QC_RPC_ID, "source-path": USAGE_SOURCE_PATH}
+
+    async def _do_req(cl: httpx.AsyncClient) -> httpx.Response:
+        return await cl.post(
+            GEMINI_BATCH_EXECUTE_URL,
+            params=params,
+            data=post_data,
+            headers=headers,
+            cookies=cookies,
+        )
+
+    try:
+        if http_client is not None:
+            resp = await _do_req(http_client)
+        else:
+            async with httpx.AsyncClient(timeout=30.0, proxy=account.proxy) as owned_cl:
+                resp = await _do_req(owned_cl)
+
+        if resp.status_code == 200:
+            return parse_jsf9qc_usage_response(resp.text), False
+        if resp.status_code == 403 or is_suspension_error(resp.text):
+            await handle_account_suspension(account, f"HTTP {resp.status_code} on /usage", persist=persist)
+            return WebUsageData(), True
+        logger.warning("Direct /usage RPC returned status %d for account '%s'", resp.status_code, account.id)
+    except Exception as exc:
+        logger.warning("Direct /usage RPC network error for account '%s': %s", account.id, exc)
+    return None, False
+
+
 async def sync_web_account_usage(
     account: WebAccount,
     *,
     client: Any = None,
+    session_manager: Any = None,
     http_client: httpx.AsyncClient | None = None,
     persist: bool = True,
     now: float | None = None,
 ) -> WebUsageData:
     """Execute authenticated RPC jSf9Qc on /usage and update ``account`` state."""
-    # First apply passive drift-safe reset check in case network query fails
     check_and_apply_drift_safe_resets(account, now=now)
 
-    usage_data: WebUsageData | None = None
-
-    # Path 1: Via GeminiClient instance (standard runtime path)
-    if client is not None:
+    if client is None and session_manager is not None:
         try:
-            if hasattr(client, "_fetch_usage_info") and callable(client._fetch_usage_info):
-                await client._fetch_usage_info()
-                raw_info = getattr(client, "_usage_info", None)
-                if raw_info and isinstance(raw_info, dict):
-                    usage_data = _parse_usage_info_dict(raw_info)
+            client = await session_manager.get_or_init_client(account)
         except Exception as exc:
             logger.warning(
-                "GeminiClient._fetch_usage_info failed for account '%s': %s",
+                "Failed to get_or_init_client for account '%s' in sync_web_account_usage: %s",
                 account.id,
                 exc,
             )
 
-    # Path 2: Direct HTTP batchexecute call (fallback or headless CLI sync)
+    usage_data: WebUsageData | None = None
+    if client is not None:
+        usage_data = await _fetch_usage_from_gemini_client(client, account.id)
+
     if usage_data is None:
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
-            ),
-            "X-Same-Domain": "1",
-        }
-        cookies = account.cookies.to_dict()
-        post_data = {
-            "f.req": json.dumps([[[JSF9QC_RPC_ID, "[]", None, "generic"]]]),
-        }
-        params = {
-            "rpcids": JSF9QC_RPC_ID,
-            "source-path": USAGE_SOURCE_PATH,
-        }
-
-        async def _do_req(cl: httpx.AsyncClient) -> httpx.Response:
-            return await cl.post(
-                GEMINI_BATCH_EXECUTE_URL,
-                params=params,
-                data=post_data,
-                headers=headers,
-                cookies=cookies,
-            )
-
-        try:
-            if http_client is not None:
-                resp = await _do_req(http_client)
-            else:
-                async with httpx.AsyncClient(timeout=30.0, proxy=account.proxy) as owned_client:
-                    resp = await _do_req(owned_client)
-
-            if resp.status_code == 200:
-                usage_data = parse_jsf9qc_usage_response(resp.text)
-            elif resp.status_code == 403 or is_suspension_error(resp.text):
-                await handle_account_suspension(account, f"HTTP {resp.status_code} on /usage", persist=persist)
-                return WebUsageData()
-            else:
-                logger.warning(
-                    "Direct /usage RPC returned status %d for account '%s'",
-                    resp.status_code,
-                    account.id,
-                )
-        except Exception as exc:
-            logger.warning("Direct /usage RPC network error for account '%s': %s", account.id, exc)
+        usage_data, suspended = await _fetch_usage_via_direct_batchexecute(
+            account, http_client=http_client, persist=persist
+        )
+        if suspended:
+            return usage_data or WebUsageData()
 
     if usage_data is not None:
         apply_web_usage_update(account, usage_data, now=now)
@@ -943,6 +965,7 @@ async def sync_all_registered_accounts(
             await sync_web_account_usage(
                 web_acc,
                 client=active_client,
+                session_manager=web_session_manager,
                 http_client=http_client,
                 persist=False,
                 now=current_time,
@@ -1053,6 +1076,7 @@ class UsageMonitor:
         return await sync_web_account_usage(
             account,
             client=client,
+            session_manager=self.web_session_manager,
             http_client=http_client,
             persist=persist,
             now=now,

@@ -575,3 +575,57 @@ async def test_usage_monitor_service_wrapper(
     # Verify suspension
     await monitor.suspend_account(sample_oauth_account, "Testing suspension")
     assert sample_oauth_account.status == "SUSPENDED"
+
+
+@pytest.mark.asyncio
+async def test_sync_web_account_usage_with_session_manager(
+    sample_web_account: WebAccount,
+) -> None:
+    """Verify sync_web_account_usage accepts session_manager kwarg and uses it to init client."""
+    mock_client = AsyncMock()
+    mock_client._fetch_usage_info = AsyncMock()
+    mock_client._usage_info = {
+        "tier": "PLUS",
+        "current_5h": {"usage_level": 0.35, "reset_at": 1780000000},
+        "weekly": {"usage_level": 0.15, "reset_at": 1780500000},
+    }
+
+    mock_session_manager = MagicMock()
+    mock_session_manager.get_or_init_client = AsyncMock(return_value=mock_client)
+
+    result = await sync_web_account_usage(
+        sample_web_account,
+        session_manager=mock_session_manager,
+        persist=False,
+    )
+
+    mock_session_manager.get_or_init_client.assert_awaited_once_with(sample_web_account)
+    mock_client._fetch_usage_info.assert_awaited_once()
+    assert result.tier == "PLUS"
+    assert result.five_hour_pct == pytest.approx(0.35)
+    assert result.weekly_pct == pytest.approx(0.15)
+
+
+@pytest.mark.asyncio
+async def test_sync_web_account_usage_explicit_client_precedence(
+    sample_web_account: WebAccount,
+) -> None:
+    """Verify explicit client takes precedence when session_manager is also passed."""
+    mock_client = AsyncMock()
+    mock_client._fetch_usage_info = AsyncMock()
+    mock_client._usage_info = {"tier": "ULTRA", "current_5h": {"usage_level": 0.5}}
+
+    mock_session_manager = MagicMock()
+    mock_session_manager.get_or_init_client = AsyncMock()
+
+    result = await sync_web_account_usage(
+        sample_web_account,
+        client=mock_client,
+        session_manager=mock_session_manager,
+        persist=False,
+    )
+
+    mock_session_manager.get_or_init_client.assert_not_called()
+    assert result.tier == "ULTRA"
+    assert result.five_hour_pct == pytest.approx(0.5)
+

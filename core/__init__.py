@@ -31,7 +31,15 @@ from core.auth_web import (
     sanitize_shared_cookie_env,
     save_account_cookies_isolated,
 )
+from core.firefox_launcher import (
+    FirefoxNotFoundError,
+    IsolatedFirefoxSession,
+    harvest_gemini_cookies_via_isolated_firefox,
+    resolve_firefox_binary,
+    run_oauth_in_isolated_firefox,
+)
 from core.model_registry import (
+    DEFAULT_OAUTH_MODELS,
     ResolvedModelSpec,
     UnifiedModelRegistry,
     build_oauth_thinking_config,
@@ -223,7 +231,14 @@ __all__ = [
     "parse_manual_cookies",
     "sanitize_shared_cookie_env",
     "save_account_cookies_isolated",
+    # Level 2 - Isolated Firefox Runner
+    "FirefoxNotFoundError",
+    "IsolatedFirefoxSession",
+    "harvest_gemini_cookies_via_isolated_firefox",
+    "resolve_firefox_binary",
+    "run_oauth_in_isolated_firefox",
     # Level 2 - Model Registry
+    "DEFAULT_OAUTH_MODELS",
     "ResolvedModelSpec",
     "UnifiedModelRegistry",
     "build_oauth_thinking_config",

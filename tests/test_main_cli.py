@@ -64,6 +64,8 @@ def clean_runtime_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("config.settings.COOKIES_CACHE_DIR", test_cookies_dir)
     monkeypatch.setattr("core.auth_web.COOKIES_CACHE_DIR", test_cookies_dir)
     monkeypatch.setattr(main, "auto_discover_firefox_cookies", lambda: (None, None))
+    monkeypatch.setattr("core.usage_monitor.sync_web_account_usage", AsyncMock())
+    monkeypatch.setattr("core.model_registry.discover_web_models", AsyncMock(return_value=["gemini-4-argon", "gemini-3.8-flash"]))
 
     yield
 
@@ -587,7 +589,7 @@ def test_cli_add_oauth_automatic_callback_success(
     runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """add-oauth in interactive mode must capture code via OAuthCallbackServer without manual paste."""
+    """add-oauth in interactive mode must capture code via authorize_oauth_via_isolated_firefox without manual paste."""
     mock_pkce = PKCEChallenge(
         code_verifier="test_verifier_string_of_sufficient_length_1234567890",
         code_challenge="test_challenge",
@@ -604,20 +606,56 @@ def test_cli_add_oauth_automatic_callback_success(
     monkeypatch.setattr(main, "discover_oauth_models", AsyncMock(return_value=["gemini-3.8-flash"]))
     monkeypatch.setattr(main, "_is_interactive_terminal", lambda: True)
 
-    with patch("webbrowser.open") as mock_browser, \
-         patch.object(main.OAuthCallbackServer, "start", new_callable=AsyncMock) as mock_start, \
-         patch.object(main.OAuthCallbackServer, "wait_for_code", new_callable=AsyncMock) as mock_wait:
-        mock_start.return_value = 8000
-        mock_wait.return_value = "auto_captured_code_789"
-
+    with patch(
+        "main.authorize_oauth_via_isolated_firefox",
+        new_callable=AsyncMock,
+        return_value=("auto_captured_code_789", "http://localhost:8000/oauth/callback"),
+    ) as mock_auth:
         result = runner.invoke(cli, ["add-oauth", "--id", "auto-oauth-zero-copy"])
 
         assert result.exit_code == 0
-        assert "Opening Google authorization page in your browser" in result.output
+        assert "Opening Google authorization page in isolated Firefox" in result.output
+        assert "Open the following URL in your browser to authorize Antigravity CLI" in result.output
         assert "Successfully registered OAuth account 'auto-oauth-zero-copy'" in result.output
-        mock_browser.assert_called_once_with("https://mock.auth.url")
+        mock_auth.assert_awaited_once_with(
+            pkce=mock_pkce,
+            preferred_port=8000,
+            timeout=180.0,
+        )
         registered = state_registry.get_oauth_account("auto-oauth-zero-copy")
         assert registered is not None
         assert registered.credentials.project_id == "auto-discovered-proj"
+
+
+def test_cli_add_web_interactive_isolated_firefox_success(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """add-web in interactive mode captures cookies via isolated Firefox and registers account."""
+    mock_cookies = WebCookies(secure_1psid="psid_from_isolated_ff", secure_1psidts="ts_from_isolated_ff")
+    monkeypatch.setattr(main, "_is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(main, "save_accounts_snapshot", AsyncMock())
+    monkeypatch.setattr(main, "save_account_cookies_isolated", MagicMock())
+
+    with patch(
+        "main.login_web_via_isolated_firefox",
+        new_callable=AsyncMock,
+        return_value=mock_cookies,
+    ) as mock_login, \
+         patch("core.auth_web.default_web_session_manager.get_or_init_client", new_callable=AsyncMock) as mock_client, \
+         patch("core.usage_monitor.sync_web_account_usage", new_callable=AsyncMock) as mock_usage, \
+         patch("core.model_registry.discover_web_models", new_callable=AsyncMock, return_value=["gemini-4-argon"]) as mock_discover:
+
+        result = runner.invoke(cli, ["add-web", "--id", "iso-web-acc"])
+
+        assert result.exit_code == 0
+        assert "Launching isolated Firefox to capture credentials automatically" in result.output
+        assert "Successfully registered Web account 'iso-web-acc'" in result.output
+        mock_login.assert_awaited_once_with(timeout_seconds=180.0)
+        registered = state_registry.get_web_account("iso-web-acc")
+        assert registered is not None
+        assert registered.cookies.secure_1psid == "psid_from_isolated_ff"
+        assert registered.discovered_models == ["gemini-4-argon"]
+
 
 

@@ -57,6 +57,9 @@ lmdb_data/
 .env
 .env.*
 !.env.example
+config/accounts.json
+config/accounts.json.*
+config/model_routes.json
 
 # Runtime & Cookie Caches (preserve directory structure only)
 config/cookies_cache/*

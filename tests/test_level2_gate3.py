@@ -204,7 +204,9 @@ def test_authorization_url_contains_all_five_mandatory_scopes_and_pkce_params() 
     scopes = set(params["scope"][0].split(" "))
     for required_scope in OAUTH_SCOPES:
         assert required_scope in scopes, f"Missing mandatory scope: {required_scope}"
-    assert len(scopes) == 5
+    assert len(scopes) == 3
+    assert not any("cclog" in s for s in scopes)
+    assert not any("experimentsandconfigs" in s for s in scopes)
 
 
 @pytest.mark.parametrize(

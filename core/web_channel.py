@@ -689,6 +689,7 @@ async def execute_web_channel_stream(
             client=client,
             messages=messages,
             model=base_model if isinstance(model, str) else model,
+            reasoning_effort=resolved_spec.effort or reasoning_effort,
             system_prompt=system_prompt,
             tools=tools,
             headers=headers,

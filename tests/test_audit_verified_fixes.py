@@ -199,3 +199,60 @@ def test_h4_2_cli_flags_compatibility() -> None:
     assert "--add-oauth" in result.output
     assert "--add-web" in result.output
     assert "--firefox-profile" in result.output
+
+
+def test_start_client_chat_session_no_temporary_and_effort_resolution() -> None:
+    """Verify that _start_client_chat_session never passes temporary to start_chat and resolves effort suffixes."""
+    from core.prefix_differ import _start_client_chat_session, RehydrationPlan, TIER2_INLINE_HISTORY
+    from core.model_registry import resolve_web_model_sync
+
+    class MockChatSession:
+        def __init__(self, **kwargs: Any) -> None:
+            # Emulates gemini_webapi ChatSession.__init__ rejecting temporary
+            if "temporary" in kwargs:
+                raise TypeError("ChatSession.__init__() got an unexpected keyword argument 'temporary'")
+            self.kwargs = kwargs
+
+    class MockGeminiClient:
+        def __init__(self) -> None:
+            self._models = {
+                "gemini-pro": "resolved-pro-object",
+                "gemini-3.1-pro": "resolved-pro-object",
+                "gemini-argon": "resolved-argon-object",
+            }
+
+        def start_chat(self, **kwargs: Any) -> MockChatSession:
+            return MockChatSession(**kwargs)
+
+        def _resolve_model_by_name(self, name: str) -> str:
+            if name in self._models:
+                return self._models[name]
+            # alias / normalized fallback
+            norm = name.replace("-3.1", "").replace("-4", "")
+            if norm in self._models:
+                return self._models[norm]
+            raise ValueError(f"Unknown model name: {name}")
+
+    client = MockGeminiClient()
+    plan = RehydrationPlan(
+        tier=TIER2_INLINE_HISTORY,
+        temporary=True,
+        prompt="hello",
+        resume_metadata=["cid_1", "rid_1", "rcid_1"],
+        full_prefix_hash="hash_123",
+    )
+
+    # 1. Base model
+    chat1 = _start_client_chat_session(client, plan, "gemini-3.1-pro")
+    assert chat1.kwargs.get("metadata") == ["cid_1", "rid_1", "rcid_1"]
+    assert chat1.kwargs.get("model") == "resolved-pro-object"
+    assert "temporary" not in chat1.kwargs
+
+    # 2. Effort suffix model (from Cline / OpenAI client)
+    chat2 = _start_client_chat_session(client, plan, "gemini-3.1-pro-high")
+    assert chat2.kwargs.get("model") == "resolved-pro-object"
+    assert "temporary" not in chat2.kwargs
+
+    # 3. resolve_web_model_sync helper
+    resolved = resolve_web_model_sync(client, "gemini-3.1-pro-high")
+    assert resolved == "resolved-pro-object"

@@ -1098,11 +1098,21 @@ def _start_client_chat_session(
     )
 
     eff_model = model
-    if isinstance(model, str) and hasattr(client, "resolve_model"):
+    if isinstance(model, str):
         try:
-            from core.model_registry import parse_model_and_effort, resolve_web_model
-            base_m, eff = parse_model_and_effort(model)
-            eff_model = resolve_web_model(client, base_m, reasoning_effort=eff)
+            from core.model_registry import split_model_effort_suffix
+            base_m, _ = split_model_effort_suffix(model)
+            resolve_fn = getattr(client, "resolve_model", None) or getattr(
+                client, "_resolve_model_by_name", None
+            )
+            if callable(resolve_fn):
+                try:
+                    res = resolve_fn(base_m)
+                    eff_model = res if res is not None else base_m
+                except Exception:
+                    eff_model = base_m
+            else:
+                eff_model = base_m
         except Exception:
             eff_model = model
 
@@ -1111,23 +1121,38 @@ def _start_client_chat_session(
         call_kwargs["metadata"] = plan.resume_metadata
     if eff_model is not None and (accepts_var_kw or "model" in sig.parameters):
         call_kwargs["model"] = eff_model
-    if accepts_var_kw or "temporary" in sig.parameters:
+    # NOTE: Never pass temporary to start_chat when accepts_var_kw is True!
+    # In gemini_webapi, start_chat has **kwargs but ChatSession.__init__ does not accept temporary;
+    # temporary is accepted by send_message_stream.
+    if "temporary" in sig.parameters and not accepts_var_kw:
         call_kwargs["temporary"] = plan.temporary
 
     return start_chat_fn(**call_kwargs)
 
 
-def _open_chat_message_stream(chat: Any, plan: RehydrationPlan) -> Any:
-    """Call ``chat.send_message_stream`` with ``plan.prompt`` and optional ``plan.files``."""
+def _open_chat_message_stream(
+    chat: Any,
+    plan: RehydrationPlan,
+    reasoning_effort: str | None = None,
+) -> Any:
+    """Call ``chat.send_message_stream`` with ``plan.prompt``, ``temporary``, and ``extended_thinking``."""
     send_fn = chat.send_message_stream
     sig = inspect.signature(send_fn)
     accepts_var_kw = any(
         p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
     )
 
+    call_kwargs: dict[str, Any] = {}
     if plan.files and (accepts_var_kw or "files" in sig.parameters):
-        return send_fn(plan.prompt, files=plan.files)
-    return send_fn(plan.prompt)
+        call_kwargs["files"] = plan.files
+    if accepts_var_kw or "temporary" in sig.parameters:
+        call_kwargs["temporary"] = plan.temporary
+    if reasoning_effort in ("high", "medium") and (
+        accepts_var_kw or "extended_thinking" in sig.parameters
+    ):
+        call_kwargs["extended_thinking"] = True
+
+    return send_fn(plan.prompt, **call_kwargs)
 
 
 @dataclass
@@ -1171,9 +1196,12 @@ async def _iterate_chat_chunks(
     chat: Any,
     plan: RehydrationPlan,
     accumulated_parts: list[str],
+    reasoning_effort: str | None = None,
 ) -> AsyncIterator[Any]:
     """Yield chunks from ``chat.send_message_stream`` while recording text deltas."""
-    stream_or_coro = _open_chat_message_stream(chat, plan)
+    stream_or_coro = _open_chat_message_stream(
+        chat, plan, reasoning_effort=reasoning_effort
+    )
     stream = await stream_or_coro if inspect.isawaitable(stream_or_coro) else stream_or_coro
 
     async for chunk in stream:
@@ -1187,11 +1215,14 @@ async def _stream_and_persist_turn(
     client: Any,
     model: Any,
     completion_ctx: _SessionCompletionContext,
+    reasoning_effort: str | None = None,
 ) -> AsyncIterator[Any]:
     """Run ``start_chat``, yield all stream chunks, and persist the resulting session."""
     accumulated_parts: list[str] = []
     chat = _start_client_chat_session(client, completion_ctx.plan, model)
-    async for chunk in _iterate_chat_chunks(chat, completion_ctx.plan, accumulated_parts):
+    async for chunk in _iterate_chat_chunks(
+        chat, completion_ctx.plan, accumulated_parts, reasoning_effort=reasoning_effort
+    ):
         yield chunk
     _persist_completed_session(completion_ctx, chat, "".join(accumulated_parts))
 
@@ -1202,6 +1233,7 @@ async def execute_rehydrated_stream(
     messages: Sequence[Mapping[str, Any]],
     *,
     model: Any = None,
+    reasoning_effort: str | None = None,
     system_prompt: str = "",
     tools: Sequence[Mapping[str, Any]] | None = None,
     headers: Mapping[str, str] | None = None,
@@ -1212,6 +1244,15 @@ async def execute_rehydrated_stream(
 ) -> AsyncIterator[Any]:
     """Execute a streaming Web request with 3-tier context rehydration and guaranteed cleanup."""
     store = lmdb_store if lmdb_store is not None else get_lmdb_store()
+    effective_effort = reasoning_effort
+    if effective_effort is None and isinstance(model, str):
+        try:
+            from core.model_registry import split_model_effort_suffix
+            _, extracted_eff = split_model_effort_suffix(model)
+            effective_effort = extracted_eff
+        except Exception:
+            pass
+
     plan = build_rehydration_plan(
         account.id,
         messages,
@@ -1233,10 +1274,14 @@ async def execute_rehydrated_stream(
     try:
         if plan.tier == TIER1_PREFIX_HIT and plan.conversation_cid:
             async with account.get_conversation_lock(plan.conversation_cid):
-                async for chunk in _stream_and_persist_turn(client, model, completion_ctx):
+                async for chunk in _stream_and_persist_turn(
+                    client, model, completion_ctx, reasoning_effort=effective_effort
+                ):
                     yield chunk
         else:
-            async for chunk in _stream_and_persist_turn(client, model, completion_ctx):
+            async for chunk in _stream_and_persist_turn(
+                client, model, completion_ctx, reasoning_effort=effective_effort
+            ):
                 yield chunk
     finally:
         remove_temp_history_file(plan.temp_file_path)

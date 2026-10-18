@@ -30,6 +30,7 @@ import secrets
 import sys
 import time
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import click
@@ -52,6 +53,7 @@ from config.settings import (
 )
 from core.auth_oauth_cli import (
     OAuthCallbackServer,
+    authorize_oauth_via_isolated_firefox,
     build_authorization_url,
     complete_oauth_login,
     extract_code_from_manual_input,
@@ -62,6 +64,7 @@ from core.auth_web import (
     extract_firefox_cookies,
     get_account_cookie_cache_path,
     get_saved_info_hygiene_notice,
+    login_web_via_isolated_firefox,
     parse_cookie_header_or_dict,
     parse_manual_cookies,
     save_account_cookies_isolated,
@@ -71,7 +74,11 @@ from core.hybrid_scheduler import (
     calculate_oauth_account_score,
     calculate_web_account_score,
 )
-from core.model_registry import discover_oauth_models, unified_model_registry
+from core.model_registry import (
+    DEFAULT_OAUTH_MODELS,
+    discover_oauth_models,
+    unified_model_registry,
+)
 from core.prefix_differ import cleanup_orphaned_temp_files
 from core.usage_monitor import sync_all_registered_accounts
 
@@ -372,7 +379,100 @@ def health_cmd(ctx: click.Context) -> None:
     ctx.invoke(status_cmd)
 
 
-@click.command(name="add-oauth", help="Interactive wizard to link an OAuth CLI account.")
+def _display_auth_url(auth_url: str) -> None:
+    """Display authorization URL instructions for OAuth flow."""
+    click.echo("\n--- Step 1: Authorize with Google ---")
+    click.echo("Open the following URL in your browser to authorize Antigravity CLI:\n")
+    click.echo(auth_url)
+
+
+def _obtain_oauth_code(
+    pkce: PKCEChallenge,
+    redirect_uri: str,
+    is_interactive: bool,
+) -> tuple[str, str]:
+    """Obtain OAuth code either via isolated Firefox or manual input fallback."""
+    code: str | None = None
+    if is_interactive:
+        click.echo("Opening Google authorization page in isolated Firefox...")
+        click.echo("Awaiting Google sign-in in isolated Firefox (press Ctrl+C to cancel)...")
+        try:
+            code, redirect_uri = asyncio.run(
+                authorize_oauth_via_isolated_firefox(
+                    pkce=pkce,
+                    preferred_port=8000,
+                    timeout=180.0,
+                )
+            )
+        except KeyboardInterrupt:
+            click.echo("\nCancelled browser callback wait. Switching to manual input.")
+        except Exception as exc:
+            logger.debug("Automatic callback listener not active or timed out: %s", exc)
+            click.echo(f"\nNotice: Automatic callback listener not active ({exc}). Switching to manual input.")
+
+    if not code:
+        if not is_interactive:
+            click.echo("\n--- Step 2: Complete Authentication ---")
+        user_input = click.prompt("Paste the redirected URL or authorization code")
+        cleaned_input = user_input.strip()
+        if cleaned_input.startswith(("http://", "https://")):
+            parsed_url = urlparse(cleaned_input)
+            if parsed_url.netloc:
+                redirect_uri = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        code = extract_code_from_manual_input(cleaned_input, expected_state=pkce.state)
+
+    return code, redirect_uri
+
+
+def _complete_and_register_oauth(
+    account_id: str,
+    label: str | None,
+    mode: str,
+    code: str,
+    redirect_uri: str,
+    verifier: str,
+) -> None:
+    """Exchange code for credentials, discover models, and persist account."""
+    click.echo("\nExchanging code for tokens and discovering cloud project...")
+    try:
+        credentials = asyncio.run(
+            complete_oauth_login(
+                code=code,
+                redirect_uri=redirect_uri,
+                code_verifier=verifier,
+            )
+        )
+        account = OAuthAccount(
+            id=account_id,
+            label=label or account_id,
+            transport_mode=mode,
+            credentials=credentials,
+            status="ACTIVE",
+        )
+        try:
+            discovered = asyncio.run(discover_oauth_models(account))
+            if discovered:
+                account.discovered_models = discovered
+        except Exception as exc:
+            logger.warning("OAuth model discovery notice for '%s': %s", account_id, exc)
+
+        if not account.discovered_models:
+            account.discovered_models = list(DEFAULT_OAUTH_MODELS)
+        state_registry.upsert_oauth_account(account)
+        asyncio.run(save_accounts_snapshot())
+
+        click.secho(
+            f"Successfully registered OAuth account '{account_id}' "
+            f"(Project: {credentials.project_id or 'unknown'}, "
+            f"Models: {len(account.discovered_models)})!",
+            fg="green",
+        )
+    except Exception as exc:
+        logger.error("OAuth registration failed: %s", exc)
+        raise click.ClickException(f"OAuth registration failed: {exc}")
+
+
+@click.command(name="add-oauth", help="Interactive wizard to add an OAuth CLI account.")
 @click.option("--id", "account_id", default=None, help="Unique identifier for the OAuth account.")
 @click.option("--label", default=None, help="Human-readable label for the OAuth account.")
 @click.option(
@@ -399,77 +499,58 @@ def add_oauth(
     pkce = generate_pkce_pair()
     redirect_uri = "http://localhost:8000/oauth/callback"
     auth_url = build_authorization_url(redirect_uri=redirect_uri, pkce=pkce)
-
-    click.echo("\n--- Step 1: Authorize with Google ---")
-    click.echo("Open the following URL in your browser to authorize Gemini CLI:\n")
-    click.echo(auth_url)
+    _display_auth_url(auth_url)
 
     is_interactive = _is_interactive_terminal()
-    code: str | None = None
+    code, redirect_uri = _obtain_oauth_code(pkce, redirect_uri, is_interactive)
+    _complete_and_register_oauth(account_id, label, mode, code, redirect_uri, pkce.code_verifier)
 
-    if is_interactive:
-        click.echo("Opening Google authorization page in your browser...")
-        try:
-            import webbrowser
-            webbrowser.open(auth_url)
-        except Exception as exc:
-            logger.debug("Failed to auto-open browser: %s", exc)
 
-        click.echo("\n--- Step 2: Complete Authentication ---")
-        click.echo("Awaiting Google sign-in in your browser (press Ctrl+C to cancel)...")
-        try:
-            async def _listen_for_callback() -> str:
-                server = OAuthCallbackServer(
-                    host="127.0.0.1",
-                    port=8000,
-                    expected_state=pkce.state,
-                )
-                await server.start()
-                return await server.wait_for_code(timeout=180.0)
-
-            code = asyncio.run(_listen_for_callback())
-        except KeyboardInterrupt:
-            click.echo("\nCancelled browser callback wait. Switching to manual input.")
-        except Exception as exc:
-            logger.debug("Automatic callback listener not active or timed out: %s", exc)
-            click.echo(f"\nNotice: Automatic callback listener not active ({exc}). Switching to manual input.")
-
-    if not code:
-        if not is_interactive:
-            click.echo("\n--- Step 2: Complete Authentication ---")
-        user_input = click.prompt("Paste the redirected URL or authorization code")
-        code = extract_code_from_manual_input(user_input, expected_state=pkce.state)
-
-    click.echo("\nExchanging code for tokens and discovering cloud project...")
+def _discover_and_persist_web_account(account: WebAccount) -> None:
+    """Discover models for new web account and persist snapshot."""
     try:
-        credentials = asyncio.run(
-            complete_oauth_login(
-                code=code,
-                redirect_uri=redirect_uri,
-                code_verifier=pkce.code_verifier,
-            )
-        )
-        account = OAuthAccount(
-            id=account_id,
-            label=label or account_id,
-            transport_mode=mode,
-            credentials=credentials,
-            status="ACTIVE",
-        )
-        discovered = asyncio.run(discover_oauth_models(account))
-        account.discovered_models = discovered
-        state_registry.upsert_oauth_account(account)
-        asyncio.run(save_accounts_snapshot())
+        from core.auth_web import default_web_session_manager
+        from core.model_registry import discover_web_models
+        from core.usage_monitor import sync_web_account_usage
 
-        click.secho(
-            f"Successfully registered OAuth account '{account_id}' "
-            f"(Project: {credentials.project_id or 'unknown'}, "
-            f"Models: {len(discovered)})!",
-            fg="green",
-        )
+        client = asyncio.run(default_web_session_manager.get_or_init_client(account))
+        asyncio.run(sync_web_account_usage(account, client=client, persist=False))
+        discovered = asyncio.run(discover_web_models(account, client))
+        if discovered:
+            account.discovered_models = discovered
     except Exception as exc:
-        logger.error("OAuth registration failed: %s", exc)
-        raise click.ClickException(f"OAuth registration failed: {exc}")
+        logger.warning("Web account model discovery notice: %s", exc)
+
+    if not account.discovered_models:
+        account.discovered_models = [
+            "gemini-4-argon",
+            "gemini-3.1-pro",
+            "gemini-3.8-flash",
+            "gemini-3.1-flash-lite",
+        ]
+    asyncio.run(save_accounts_snapshot())
+
+
+def _prompt_for_web_cookies() -> WebCookies:
+    """Prompt user for cookie input or browser launch."""
+    click.echo("\nSelect cookie source:")
+    click.echo("  1. Firefox profile directory or cookies.sqlite file")
+    click.echo("  2. Manual cookie input (Cookie header, JSON, or __Secure-1PSID)")
+    click.echo("  3. Launch isolated Firefox to sign in")
+    choice = click.prompt("Choose option [1, 2, or 3]", default="2", type=click.Choice(["1", "2", "3"]))
+
+    if choice == "1":
+        firefox_path = click.prompt("Enter Firefox cookies.sqlite or profile path")
+        return extract_firefox_cookies(firefox_path.strip())
+    if choice == "3":
+        return asyncio.run(login_web_via_isolated_firefox(timeout_seconds=180.0))
+
+    cookie_input = click.prompt("Enter Cookie header, JSON, or __Secure-1PSID")
+    cleaned_input = cookie_input.strip()
+    if "__Secure-1PSID" in cleaned_input or ";" in cleaned_input or "{" in cleaned_input:
+        return parse_cookie_header_or_dict(cleaned_input)
+    psidts_input = click.prompt("Enter __Secure-1PSIDTS (optional)", default="", show_default=False)
+    return parse_manual_cookies(cleaned_input, psidts_input)
 
 
 @click.command(name="add-web", help="Interactive wizard to add a Web Cookie account.")
@@ -498,8 +579,6 @@ def add_web(
         if firefox_profile and firefox_profile.strip().lower() not in ("default-release", "default"):
             parsed_cookies = extract_firefox_cookies(firefox_profile.strip())
         else:
-            # If --firefox-profile is not given or is "default-release":
-            # Automatically auto-detect the user's Firefox profile
             sqlite_path, detected = auto_discover_firefox_cookies()
             if detected and detected.secure_1psid:
                 parsed_cookies = detected
@@ -509,43 +588,15 @@ def add_web(
                 )
             elif is_interactive:
                 click.echo("\nNo active Gemini session found in Firefox.")
-                click.echo("Opening https://gemini.google.com in browser...")
+                click.echo("Launching isolated Firefox to capture credentials automatically...")
                 try:
-                    import webbrowser
-                    webbrowser.open("https://gemini.google.com")
-                except Exception:
-                    pass
-                click.prompt(
-                    "Sign in to Gemini in Firefox, then press Enter to capture credentials automatically",
-                    default="",
-                    show_default=False,
-                )
-                sqlite_path2, detected2 = auto_discover_firefox_cookies()
-                if detected2 and detected2.secure_1psid:
-                    parsed_cookies = detected2
-                    click.secho("✓ Successfully captured cookies from Firefox!", fg="cyan")
+                    parsed_cookies = asyncio.run(login_web_via_isolated_firefox(timeout_seconds=180.0))
+                    click.secho("✓ Successfully captured cookies from isolated Firefox!", fg="cyan")
+                except Exception as exc:
+                    logger.debug("Isolated browser login failed: %s", exc)
 
         if not parsed_cookies:
-            click.echo("\nSelect cookie source:")
-            click.echo("  1. Firefox profile directory or cookies.sqlite file")
-            click.echo("  2. Manual cookie input (Cookie header, JSON, or __Secure-1PSID)")
-            choice = click.prompt("Choose option [1 or 2]", default="2", type=click.Choice(["1", "2"]))
-
-            if choice == "1":
-                firefox_path = click.prompt("Enter Firefox cookies.sqlite or profile path")
-                parsed_cookies = extract_firefox_cookies(firefox_path.strip())
-            else:
-                cookie_input = click.prompt("Enter Cookie header, JSON, or __Secure-1PSID")
-                cleaned_input = cookie_input.strip()
-                if "__Secure-1PSID" in cleaned_input or ";" in cleaned_input or "{" in cleaned_input:
-                    parsed_cookies = parse_cookie_header_or_dict(cleaned_input)
-                else:
-                    psidts_input = click.prompt(
-                        "Enter __Secure-1PSIDTS (optional)",
-                        default="",
-                        show_default=False,
-                    )
-                    parsed_cookies = parse_manual_cookies(cleaned_input, psidts_input)
+            parsed_cookies = _prompt_for_web_cookies()
 
         cookie_file_path = get_account_cookie_cache_path(account_id)
         account = WebAccount(
@@ -554,17 +605,12 @@ def add_web(
             cookie_file=str(cookie_file_path),
             cookies=parsed_cookies,
             status="ACTIVE",
-            discovered_models=[
-                "gemini-4-argon",
-                "gemini-3.1-pro",
-                "gemini-3.8-flash",
-                "gemini-3.1-flash-lite",
-            ],
+            discovered_models=[],
         )
 
         save_account_cookies_isolated(account, sync_snapshot=False)
         state_registry.upsert_web_account(account)
-        asyncio.run(save_accounts_snapshot())
+        _discover_and_persist_web_account(account)
 
         click.secho(f"Successfully registered Web account '{account_id}'!", fg="green")
         click.echo("\n--- Hygiene Notice ---")

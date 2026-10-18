@@ -22,7 +22,7 @@ import copy
 import re
 from typing import Any, Dict, Optional, Set, Tuple
 
-# Exact 20 JSON Schema meta-keys rejected by cloudcode-pa (v1internal)
+# Exact JSON Schema meta-keys rejected by cloudcode-pa (v1internal) Protobuf Schema
 UNSUPPORTED_SCHEMA_KEYS: frozenset[str] = frozenset(
     {
         "additionalProperties",
@@ -37,6 +37,8 @@ UNSUPPORTED_SCHEMA_KEYS: frozenset[str] = frozenset(
         "maxLength",
         "minimum",
         "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
         "multipleOf",
         "pattern",
         "format",
@@ -45,6 +47,19 @@ UNSUPPORTED_SCHEMA_KEYS: frozenset[str] = frozenset(
         "uniqueItems",
         "minProperties",
         "maxProperties",
+        "propertyNames",
+        "dependencies",
+        "dependentRequired",
+        "dependentSchemas",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "prefixItems",
+        "const",
+        "contentMediaType",
+        "contentEncoding",
+        "readOnly",
+        "writeOnly",
+        "deprecated",
     }
 )
 
@@ -254,6 +269,8 @@ def clean_json_schema(
         had_unresolvable_ref = True
 
     cleaned: dict[str, Any] = {}
+    if "const" in schema and "enum" not in schema:
+        cleaned["enum"] = [str(schema["const"])]
     for key, val in schema.items():
         if key in UNSUPPORTED_SCHEMA_KEYS:
             continue
@@ -422,7 +439,7 @@ def flatten_unions(schema: dict[str, Any]) -> dict[str, Any]:
         ]
 
     _flatten_type_list(flattened_schema)
-    for union_key in ("anyOf", "oneOf"):
+    for union_key in ("anyOf", "oneOf", "allOf"):
         raw_branches = flattened_schema.pop(union_key, None)
         if isinstance(raw_branches, list) and raw_branches:
             dict_branches = [b for b in raw_branches if isinstance(b, dict)]
